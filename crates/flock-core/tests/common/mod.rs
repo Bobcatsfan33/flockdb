@@ -15,12 +15,18 @@ pub fn scalar_i64(rows: &ArrowStream) -> i64 {
         .first()
         .expect("query returned no batches at all");
     assert_eq!(batch.num_rows(), 1, "expected exactly one row");
-    batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("column 0 is not a BIGINT")
-        .value(0)
+
+    // `count(*)` is BIGINT but `max(id)` over an INTEGER column is INTEGER — DuckDB does not widen
+    // a column just because the test would find it convenient, and it is right not to. Accept both
+    // rather than making every test declare BIGINT columns that no real schema has.
+    let col = batch.column(0);
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        a.value(0)
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        i64::from(a.value(0))
+    } else {
+        panic!("column 0 is {:?}, not an integer", col.data_type());
+    }
 }
 
 /// Every value of a single integer column, in order.

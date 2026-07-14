@@ -70,8 +70,8 @@ weak."*
 
 This is a hard rule and it has teeth. If the TPC-H overhead is 40 %, the README says 40 %. If
 `fork()` is O(1) in substrate and O(database) in the kernel — **it is** — then that sentence appears
-in the docs for `fork()`, not in a footnote. If `sleep()` does not do the thing its name promises —
-**it does not, in F1** — the doc comment says so in the first paragraph.
+in the docs for `fork()`, not in a footnote. If a target is **not measured** — the < 250 ms wake in
+docs/02 §7 **is not** — the docs say *not measured*, not "should be fine".
 
 > **Why:** a storage engine earns trust exactly once, and it does it by being unembarrassed about
 > its limits. A truthful 40 % is worth more than an unreproducible 12 %, because the second one gets
@@ -95,7 +95,9 @@ a database is a lie with a timer on it.
 crates/
   flock-kernel/     SqlKernel trait + the DuckDB implementation, and the page marshalling
   flock-core/       Flock, Db — the public API (docs/02 §5.3). Durability, forks, the escape hatch.
-    tests/          SQL smoke, fork isolation, snapshot/restore, export-to-stock-DuckDB
+    src/store.rs    WHERE THE COMMIT POINT IS. Commits route through substrate's DurableStore.
+    src/pool.rs     on-disk layout: one shared CAS per pool, one private WAL per database
+    tests/          SQL smoke, fork isolation, snapshot/restore, export-to-stock-DuckDB, tiering
     benches/tpch.rs TPC-H SF0.1, full stack vs raw DuckDB
 ```
 
@@ -120,6 +122,17 @@ cargo bench -p flock-core --features tpch       # fetches DuckDB's TPC-H extensi
 - [ ] no `unwrap()` / `expect()` / `panic!()` added to library code
 - [ ] every new public item has a doc comment that says *why*
 - [ ] anything that got slower, or is not what its name implies, is **written down**
+
+## The one thing to know before changing durability
+
+**Do not order the commit yourself.** `flock-core/src/store.rs` routes every commit through
+`substrate_wal::DurableStore`, which fsyncs a CRC-protected WAL record *before* installing the
+manifest. That record IS the commit point, and substrate holds it to that across 50,000 randomized
+crash-and-recover cycles.
+
+An earlier version of this repo hand-ordered it (pages → install → log) and used `Wal::checkpoint()`
+— which *truncates the log* — as if it were a commit. It worked, which is why it survived. If you
+find yourself reaching for `Pager::commit` or `Wal::checkpoint` on the write path, stop.
 
 ## The one thing to know before changing `flock-kernel`
 

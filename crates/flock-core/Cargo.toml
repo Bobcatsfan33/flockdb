@@ -13,17 +13,26 @@ categories = ["database-implementations"]
 flock-kernel = { path = "../flock-kernel", version = "0.1.0" }
 substrate-pager.workspace = true
 substrate-wal.workspace = true
+substrate-store.workspace = true
 duckdb.workspace = true
 thiserror.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+# Not a dev-dependency: `Db::sleep` stages the upload in a throwaway directory, because pointing a
+# TieredStore at the real pool would let `drop_local()` delete it. See `Db::sleep`.
 tempfile.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The `aws` feature is only for the (ignored) MinIO latency test. It is a dev-dependency: no S3
+# client is linked into anything a user of this library runs.
+object_store = { workspace = true, features = ["aws"] }
 
 [features]
 default = []
-airgap = ["flock-kernel/airgap"]
+airgap = ["flock-kernel/airgap", "substrate-store/airgap"]
 
 # Enables the TPC-H benchmark body. It pulls in no new dependencies and changes no library code —
 # it is a gate on `benches/tpch.rs` compiling to something other than a message.

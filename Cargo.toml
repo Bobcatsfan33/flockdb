@@ -13,8 +13,24 @@ repository = "https://github.com/Bobcatsfan33/flockdb"
 # Substrate is a dependency, not a destination (docs/02 §5). Pinned to a tag, never a branch:
 # a moving dependency under a storage engine means the on-disk format can change without a
 # version bump, and a store written on Tuesday stops opening on Wednesday.
-substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
-substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+#
+# v1.2.1 and not v1.1, for one reason that would have bitten us exactly once, in production, on the
+# database that mattered: v1.1's `sleep()` uploaded only the HEAD manifest. An overlay manifest
+# cannot resolve the pages it did not itself touch without its base — and overlays are the normal
+# case — so a database whose head was an overlay woke up able to read whatever the top overlay
+# happened to hold, and nothing else. Silently. v1.2.1 uploads the head's whole ancestry.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+
+# Object storage, and the async runtime it needs.
+#
+# `substrate-pager` and `substrate-wal` are synchronous on purpose (deterministic replay and crash
+# injection require deterministic execution). `substrate-store` is where tokio appears, and a cache
+# miss on the synchronous read path blocks on an async fetch — which REQUIRES a multi-threaded
+# runtime. A current-thread runtime deadlocks. That is why `sleep`/`wake` are async and say so.
+object_store = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 # `bundled` compiles DuckDB from source and links it statically. No system library, no
 # `LD_LIBRARY_PATH`, and — the reason that matters here — no network at run time, which is what

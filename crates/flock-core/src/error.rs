@@ -111,6 +111,35 @@ pub enum FlockError {
         /// The OS's account of it.
         source: std::io::Error,
     },
+
+    /// Object storage said no — during a [`sleep`](crate::Db::sleep) or a [`wake`](crate::Flock::wake).
+    ///
+    /// A failed `sleep` has **not** dropped anything: substrate uploads, verifies, and only then
+    /// discards, so a database that could not be put to sleep is still awake and still whole.
+    #[error(
+        "object storage failed during {op}: {source}\n\
+         Nothing has been discarded — `sleep` uploads and verifies BEFORE it drops anything, so the \
+         database is intact. Check the bucket's credentials, region, and network reachability, then \
+         retry.\n\
+         If this happened on `wake`, also check that the WakeToken's pool matches the tier you \
+         opened: pools are a security boundary (docs/02 §9.1) and substrate refuses to wake a \
+         database into the wrong one."
+    )]
+    Tier {
+        /// What FlockDB was doing.
+        op: &'static str,
+        /// Substrate's account of it.
+        source: substrate_store::StoreError,
+    },
+
+    /// A thing this platform cannot do.
+    #[error("{what} is not supported: {why}")]
+    Unsupported {
+        /// The operation.
+        what: &'static str,
+        /// Why not, and what the supported alternative is.
+        why: &'static str,
+    },
 }
 
 impl FlockError {
@@ -120,6 +149,10 @@ impl FlockError {
 
     pub(crate) fn wal(op: &'static str) -> impl Fn(substrate_wal::WalError) -> FlockError {
         move |source| FlockError::Wal { op, source }
+    }
+
+    pub(crate) fn tier(op: &'static str) -> impl Fn(substrate_store::StoreError) -> FlockError {
+        move |source| FlockError::Tier { op, source }
     }
 
     pub(crate) fn pool(

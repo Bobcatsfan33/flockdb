@@ -46,8 +46,9 @@
 //! | *Writes between snapshots* are durable | **NO.** They live in a DuckDB scratch file. A crash takes them. |
 //! | `fork` is O(1) end to end | **NO.** O(1) in substrate; O(database) in the kernel, which must hydrate a file for DuckDB. |
 //! | `query` streams results | **NO.** F1 materialises them. The type is called [`ArrowStream`] because the API is frozen; the laziness is F2. |
-//! | `sleep` puts a database in object storage | **NO.** F1's sleep releases compute only. Nothing is uploaded. |
-//! | Wake from S3 in < 250 ms (docs/02 §7) | **Not measured**, because the substrate API that would do it is not published yet. |
+//! | `sleep` puts a database in object storage | **Real.** Pages and the manifest's whole ancestry go to the bucket; [`Flock::wake`] brings it back into an empty directory. Tested by deleting the entire pool between the two. |
+//! | Wake is *lazy* — fetch only the pages a query reads | **NO**, and it cannot be in F1. DuckDB needs a file, so waking reconstructs the whole database and therefore downloads **all of it**. See [`Flock::wake`]. |
+//! | Wake from S3 in < 250 ms (docs/02 §7) | **NOT MEASURED.** No S3-compatible endpoint was reachable to measure against — not Docker/MinIO, not a bucket. Not "measured and passing": *not measured*. The in-process figure in the README excludes the network and is a floor, not the number. |
 //!
 //! Every one of those "NO"s has the same root cause, and it is worth naming once: **DuckDB will
 //! not let us give it a filesystem.** The `flock-kernel` crate docs carry the full investigation —
@@ -67,14 +68,26 @@
 mod db;
 mod error;
 mod pool;
-mod wake;
+mod store;
 
 pub use db::{Db, Flock};
 pub use error::{FlockError, Result};
-pub use wake::WakeToken;
 
 // Re-exported so a caller can name a snapshot's type, and the Arrow types a query returns, without
 // separately depending on substrate or on the exact `arrow` version DuckDB was built against. A
 // duplicate `arrow` in the dependency graph produces a type error that names the same type twice.
 pub use flock_kernel::{arrow, ArrowStream, KernelOpts};
 pub use substrate_pager::ManifestId;
+
+// Sleep and wake speak in substrate's own types, deliberately. A `WakeToken` is what a fleet
+// registry stores — a pool, a manifest id, and a page size, and nothing else — and wrapping it in a
+// FlockDB newtype would buy nothing and cost the caller the ability to hand it to any other tool
+// built on the same engine. `RemoteTier` is likewise just "a bucket, and which pool it holds".
+pub use substrate_store::{RemoteTier, WakeToken};
+
+/// The object-storage backends `RemoteTier` accepts (S3, GCS, Azure, in-memory, local filesystem).
+///
+/// Re-exported so callers can build one without separately depending on `object_store` and pinning
+/// the exact same version — a duplicate in the dependency graph produces a type error that names the
+/// same type twice and explains nothing.
+pub use object_store;

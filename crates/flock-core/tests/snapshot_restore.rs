@@ -22,6 +22,67 @@ fn seeded(dir: &tempfile::TempDir) -> Db {
 }
 
 #[test]
+fn many_snapshots_in_a_row_all_replay_after_the_process_dies() {
+    // ── This test exists because of a bug that was in this repository ─────────────────────────────
+    //
+    // FlockDB used to take the manifest id from `Pager::commit` — which installs a manifest and
+    // writes NO log record — and then call `Wal::checkpoint(id)`. `checkpoint` is not a commit: it
+    // persists the current head and *truncates the log behind it*. So every snapshot threw away the
+    // log, and the commit protocol was being approximated by its own garbage-collection call.
+    //
+    // It happened to work, which is the worst outcome. Now the kernel commits through
+    // `DurableStore::commit` — an fsync'd CRC-protected record before the manifest is installed —
+    // and the log is a log. Twenty commits in a row, a process death, and a replay is the cheapest
+    // way to keep it that way.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = seeded(&dir);
+        for i in 4..=23 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+            db.snapshot().unwrap();
+        }
+    } // the process "dies" — nothing is closed cleanly, nothing is flushed on the way out
+
+    let mut db = Flock::open(dir.path(), "sales").unwrap();
+    assert_eq!(
+        scalar_i64(&db.query("SELECT count(*) FROM t").unwrap()),
+        23,
+        "recovery landed on the wrong commit — the log did not replay every snapshot"
+    );
+    assert_eq!(
+        scalar_i64(&db.query("SELECT max(id) FROM t").unwrap()),
+        23,
+        "recovery must restore the LAST committed head, not an earlier one"
+    );
+}
+
+#[test]
+fn a_restore_survives_a_restart() {
+    // Restoring moves the head backwards. If that move is not made durable, the next open replays
+    // the log, lands on the newest commit, and the restore is silently undone — the caller having
+    // been told it succeeded.
+    let dir = tempfile::tempdir().unwrap();
+    let three_rows = {
+        let mut db = seeded(&dir);
+        let three_rows = db.snapshot().unwrap();
+        db.execute("INSERT INTO t VALUES (4), (5)").unwrap();
+        db.snapshot().unwrap();
+
+        db.restore(three_rows).unwrap();
+        assert_eq!(scalar_i64(&db.query("SELECT count(*) FROM t").unwrap()), 3);
+        three_rows
+    };
+
+    let mut db = Flock::open(dir.path(), "sales").unwrap();
+    assert_eq!(
+        scalar_i64(&db.query("SELECT count(*) FROM t").unwrap()),
+        3,
+        "a restore must still be in effect after a restart, or it was never really a restore"
+    );
+    assert_eq!(db.head(), three_rows);
+}
+
+#[test]
 fn restoring_a_snapshot_returns_the_database_to_exactly_that_state() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = seeded(&dir);
@@ -143,24 +204,8 @@ fn a_fork_survives_the_process_that_made_it_and_is_still_isolated() {
     );
 }
 
-#[test]
-fn sleeping_releases_the_engine_and_waking_gets_the_data_back() {
-    // F1's sleep releases compute, not storage. Read `flock_core::wake`'s module docs before
-    // believing this is the hibernation from docs/02 §1.1 — the object-storage half is not built.
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = seeded(&dir);
-    db.execute("INSERT INTO t VALUES (4)").unwrap();
-
-    let token = db.sleep().unwrap();
-    assert_eq!(token.db_name(), "sales");
-
-    let mut awake = Flock::wake(&token).unwrap();
-    assert_eq!(
-        scalar_i64(&awake.query("SELECT count(*) FROM t").unwrap()),
-        4,
-        "sleep must checkpoint, so that waking loses nothing"
-    );
-}
+// Sleep and wake are tested in `tiering.rs` — they are async, they need object storage, and they
+// need the entire pool deleted between the two halves to prove anything.
 
 #[test]
 fn writes_made_after_the_last_snapshot_do_not_survive_a_crash() {

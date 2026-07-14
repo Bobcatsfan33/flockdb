@@ -1,13 +1,15 @@
 //! [`Flock`] and [`Db`] — the public API from docs/02 §5.3.
 
 use crate::error::{FlockError, Result};
-use crate::pool::{pages_dir, validate_name, wal_dir};
-use crate::wake::WakeToken;
+use crate::pool::{db_dir, link_db_to_shared_cas, validate_name};
+use crate::store::Store;
 use flock_kernel::{ArrowStream, DuckDbKernel, KernelOpts, SqlKernel};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use substrate_pager::{std_vfs, ManifestId, PageStore, Pager, StoreConfig};
-use substrate_wal::Wal;
+use substrate_pager::{std_vfs, ManifestId, PageStore, StoreConfig};
+use substrate_store::{RemoteTier, TieredStore, WakeToken};
+use substrate_wal::DurableStore;
 
 /// A pool of databases sharing one content-addressed store.
 ///
@@ -51,50 +53,103 @@ impl Flock {
         let root = root.as_ref().to_path_buf();
         validate_name(db_name)?;
 
-        std::fs::create_dir_all(&root).map_err(FlockError::pool("create pool root", &root))?;
+        // The database's own directory: a private WAL, and `pages`/`manifests` symlinked into the
+        // pool's one shared CAS. See `pool.rs` for why that indirection has to exist.
+        let dir = link_db_to_shared_cas(&root, db_name)?;
 
-        let pager = Arc::new(open_pager(&root)?);
+        let durable = Arc::new(
+            DurableStore::open(std_vfs(), &dir, StoreConfig::default())
+                .map_err(FlockError::wal("open the durable store"))?,
+        );
 
-        let mut wal =
-            Wal::open(std_vfs(), wal_dir(&root, db_name)).map_err(FlockError::wal("open"))?;
+        // Replay. This restores the head this database had at its last commit — or, for a database
+        // that does not exist yet, leaves it at the canonical empty root.
+        //
+        // It must happen BEFORE the kernel opens, because the kernel hydrates its scratch file from
+        // whatever the head is at the moment it is constructed. Open the kernel first and every
+        // database in the pool comes up empty, and only the *second* run of the program notices.
+        durable
+            .recover()
+            .map_err(FlockError::wal("replay the log"))?;
 
-        // Replay. This sets the pager's head to the last checkpointed manifest — or, for a database
-        // that does not exist yet, to the canonical empty root. It must happen BEFORE the kernel
-        // opens, because the kernel hydrates its scratch file from whatever the head is at the
-        // moment it is constructed. Open the kernel first and every database in the pool would come
-        // up empty, and only the *second* run of the program would notice.
-        wal.recover(&pager).map_err(FlockError::wal("recover"))?;
-
-        let kernel = DuckDbKernel::open(pager.clone(), opts.clone())?;
+        let store = Store::Local(durable);
+        let kernel = DuckDbKernel::open(store.page_store(), opts.clone())?;
 
         Ok(Db {
             name: db_name.to_string(),
             root,
-            pager,
-            wal,
+            store,
             kernel,
             opts,
         })
     }
 
-    /// Bring a sleeping database back.
+    /// **Wake a sleeping database** out of object storage.
     ///
-    /// Cheap in the sense that matters — no bytes move between machines — but **not** cheap in the
-    /// sense docs/02 §7 targets, because it rehydrates a scratch file from local pages. See the
-    /// `wake` module for exactly what F1's sleep does and does not do; the summary is that the
-    /// compute half is real and the object-storage half is not built yet.
-    pub fn wake(token: &WakeToken) -> Result<Db> {
-        Flock::wake_with(token, KernelOpts::default())
+    /// `cache_root` is a *cache*, not a home: it starts empty and fills with the pages the database
+    /// actually reads. The data's home is the bucket.
+    ///
+    /// # This must run on a multi-threaded tokio runtime
+    ///
+    /// `#[tokio::main]`, or `#[tokio::test(flavor = "multi_thread")]`. Not the current-thread
+    /// runtime, and this is not a preference. Substrate's page read path is *synchronous* (so that
+    /// crash injection can be deterministic), so a cache miss blocks the calling thread on an async
+    /// fetch. On a current-thread runtime that is the executor's only thread, and it deadlocks —
+    /// silently, with no error, forever.
+    ///
+    /// # What waking actually costs in F1, which is not what docs/02 §7 hoped
+    ///
+    /// Substrate wakes **lazily**: fetch the manifest, then fetch pages only as queries touch them.
+    /// That is what makes a 100 GB database wake in 250 ms without moving 100 GB.
+    ///
+    /// **FlockDB cannot use that**, and the reason is the same one behind every other limitation
+    /// here: DuckDB needs a *file*. Before it can answer a single query the kernel must reconstruct
+    /// the whole database file, which reads **every page**, which faults in **the entire database
+    /// from object storage**. Waking a 100 GB FlockDB database moves 100 GB.
+    ///
+    /// The code below is nonetheless written against the lazy API, because it is correct and because
+    /// the day DuckDB exposes a filesystem hook, this method becomes fast without being rewritten.
+    /// Today it is honest to call it *"restore from object storage"* and not *"wake"*.
+    pub async fn wake(
+        cache_root: impl AsRef<Path>,
+        db_name: &str,
+        remote: RemoteTier,
+        token: &WakeToken,
+    ) -> Result<Db> {
+        Flock::wake_with(cache_root, db_name, remote, token, KernelOpts::default()).await
     }
 
     /// [`Flock::wake`], with control over the SQL engine's threads and memory.
-    pub fn wake_with(token: &WakeToken, opts: KernelOpts) -> Result<Db> {
-        let db = Flock::open_with(token.pool_root(), token.db_name(), opts)?;
-        // The token names an exact state, and it wins over whatever the WAL last checkpointed.
-        // Ordinarily they agree — `sleep()` checkpoints before it returns the token — but a token
-        // is a *value*, and honouring it exactly is what makes it safe for a fleet registry to hold
-        // one for a year and hand it back.
-        db.restore_into(token.manifest())
+    pub async fn wake_with(
+        cache_root: impl AsRef<Path>,
+        db_name: &str,
+        remote: RemoteTier,
+        token: &WakeToken,
+        opts: KernelOpts,
+    ) -> Result<Db> {
+        let root = cache_root.as_ref().to_path_buf();
+        validate_name(db_name)?;
+        std::fs::create_dir_all(&root).map_err(FlockError::pool("create cache root", &root))?;
+
+        let tiered = TieredStore::wake(&root, remote, token)
+            .await
+            .map_err(FlockError::tier("wake"))?;
+
+        let store = Store::Tiered(Arc::new(tiered));
+
+        // Hydration reads every page, and every one of them is a cache miss against the bucket. It
+        // blocks. On a multi-threaded runtime that costs one worker thread for the duration, which
+        // is exactly what substrate's own synchronous read path does on a cache miss — so this is
+        // consistent with the engine's design rather than a corner we cut.
+        let kernel = DuckDbKernel::open(store.page_store(), opts.clone())?;
+
+        Ok(Db {
+            name: db_name.to_string(),
+            root,
+            store,
+            kernel,
+            opts,
+        })
     }
 }
 
@@ -108,35 +163,38 @@ impl Flock {
 /// | [`snapshot`](Db::snapshot) | O(1) — remember a 32-byte id | O(database) — the file→pages sync |
 /// | [`fork`](Db::fork) | O(1) — a new manifest, no bytes copied | O(database) — rehydrate a scratch file |
 /// | [`restore`](Db::restore) | O(1) — move a pointer | O(database) — rehydrate a scratch file |
-/// | [`sleep`](Db::sleep) | O(1) | O(database) — one last sync |
+/// | [`sleep`](Db::sleep) | O(database) — upload | O(database) — one last sync |
 ///
-/// The left column is the architecture. **The right column is the price of the fallback**, and it
-/// is the price a DuckDB filesystem hook would abolish — see the `flock-kernel` crate docs for why
-/// that hook is not reachable from Rust today.
+/// The left column is the architecture. **The right column is the price of the fallback**, and it is
+/// the price a DuckDB filesystem hook would abolish — see the `flock-kernel` crate docs for why that
+/// hook is not reachable from Rust today.
 pub struct Db {
     name: String,
     root: PathBuf,
-    /// Concrete `Pager`, not `Box<dyn PageStore>`, because forking needs `Pager::at` — the inherent
-    /// method that hands back a *typed* store positioned at a manifest. `PageStore::fork` returns a
-    /// `Box<dyn PageStore>`, and a trait object cannot be forked again with a private WAL.
-    pager: Arc<Pager>,
-    wal: Wal,
+    store: Store,
     kernel: DuckDbKernel,
     opts: KernelOpts,
 }
 
 /// Names the database and where it is, and *nothing else*.
 ///
-/// Deliberately not derived. A derived `Debug` would reach into the `Pager` and the `Wal`, and one
+/// Deliberately not derived. A derived `Debug` would reach into the store and print pages, and one
 /// day someone would log a `Db` at debug level and put a page of a customer's data into a log
-/// aggregator. The three fields below are the three a human debugging a fleet actually wants, and
-/// none of them is data.
+/// aggregator. The fields below are the ones a human debugging a fleet actually wants, and none of
+/// them is data.
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db")
             .field("name", &self.name)
-            .field("pool", &self.root)
-            .field("head", &self.pager.head())
+            .field("root", &self.root)
+            .field(
+                "durability",
+                match self.store {
+                    Store::Local(_) => &"local WAL",
+                    Store::Tiered(_) => &"object storage",
+                },
+            )
+            .field("head", &self.store.head())
             .finish_non_exhaustive()
     }
 }
@@ -147,15 +205,20 @@ impl Db {
         &self.name
     }
 
-    /// The pool this database lives in.
+    /// The pool this database lives in — or, for a woken database, its local page cache.
     pub fn pool_root(&self) -> &Path {
         &self.root
     }
 
+    /// The manifest this database currently *is*.
+    pub fn head(&self) -> ManifestId {
+        self.store.head()
+    }
+
     /// Run a query. Results come back as Arrow (docs/02 §6.1).
     ///
-    /// See [`ArrowStream`] for the one thing that is not yet true about the name: F1 materialises
-    /// the whole result rather than streaming it.
+    /// See [`ArrowStream`] for the one thing that is not yet true about the name: F1 materialises the
+    /// whole result rather than streaming it.
     pub fn query(&mut self, sql: &str) -> Result<ArrowStream> {
         Ok(self.kernel.query(sql)?)
     }
@@ -163,64 +226,99 @@ impl Db {
     /// Run a statement for its effect. Returns the number of rows it changed.
     ///
     /// **This does not make anything durable.** The write lands in DuckDB's scratch file; substrate
-    /// hears about it at the next [`snapshot`](Db::snapshot). That boundary is the fallback's, it
-    /// is real, and it is spelled out in full in the `flock-kernel` crate docs.
+    /// hears about it at the next [`snapshot`](Db::snapshot). That boundary is the fallback's, it is
+    /// real, and it is spelled out in full in the `flock-kernel` crate docs.
     pub fn execute(&mut self, sql: &str) -> Result<u64> {
         Ok(self.kernel.execute(sql)?)
     }
 
+    /// Run several statements separated by `;`.
+    pub fn execute_batch(&mut self, sql: &str) -> Result<()> {
+        Ok(self.kernel.execute_batch(sql)?)
+    }
+
     /// Take a snapshot. **This is the commit point.**
     ///
-    /// Returns a [`ManifestId`]: a 32-byte content hash that *is* the complete state of this
-    /// database at this instant. Hand it to [`restore`](Db::restore) at any point in the future and
-    /// you are back here exactly.
+    /// Returns a [`ManifestId`]: a 32-byte content hash that *is* the complete state of this database
+    /// at this instant. Hand it to [`restore`](Db::restore) at any point in the future and you are
+    /// back here exactly.
     ///
     /// # What happens, in the order it happens
     ///
     /// ```text
     ///   1. DuckDB folds its own WAL into its main file
     ///   2. the file is chunked into pages; changed pages go to the CAS and are fsync'd
-    ///   3. substrate derives and installs the manifest
-    ///   4. the manifest id is written to substrate's WAL and fsync'd   ← THE COMMIT POINT
+    ///   3. a CRC-protected commit record is fsync'd to substrate's WAL   ← THE COMMIT POINT
+    ///   4. the manifest is installed, and readers can see it
     /// ```
     ///
-    /// A crash before step 4 leaves durable pages that nothing references and a manifest nothing
-    /// points at — garbage, which GC sweeps, and the database opens at the previous snapshot,
-    /// whole. A crash after step 4 is a snapshot that happened. There is no state in between, and
-    /// that is the durability guarantee (docs/02 §3.1).
+    /// **Steps 3 and 4 are in that order, and it matters.** FlockDB does not choose that order or
+    /// implement it: [`substrate_wal::DurableStore`] does, and substrate's fuzz suite holds it to it
+    /// across 50,000 randomized crash-and-recover cycles that kill the write path at every byte
+    /// boundary in turn. A crash before step 3 leaves durable pages that nothing references —
+    /// garbage, which GC sweeps — and the database opens at the previous snapshot, whole. A crash
+    /// between 3 and 4 is a commit that happened: recovery re-derives the identical manifest from the
+    /// log and installs it. There is no state in between.
+    ///
+    /// (An earlier version of FlockDB ordered these itself, and had them the other way round. See the
+    /// `store` module for what was wrong with that and why it is not the sort of thing to eyeball.)
+    ///
+    /// # On a woken database, the commit point is somewhere else
+    ///
+    /// A database restored by [`Flock::wake`] has **no local WAL** — its durability is the bucket.
+    /// `snapshot()` still returns a manifest id, and the pages are queued for upload, but *durable*
+    /// means *in object storage*, and that has not necessarily happened yet when this returns. Call
+    /// [`ensure_durable`](Db::ensure_durable) to wait for it. We would rather hand you a second
+    /// method than let the word "commit" quietly mean two different things.
     ///
     /// # And the part that is *not* free
     ///
     /// The snapshot itself is O(1) — substrate measures it at 15 ns. Step 2 is not: it reads the
-    /// whole database file. Snapshots in F1 are cheap in *manifests* and linear in *I/O*. Do not
-    /// take one per row.
+    /// whole database file. Snapshots in F1 are cheap in *manifests* and linear in *I/O*. Measured at
+    /// 33 ms on a 26 MiB database. Do not take one per row.
     pub fn snapshot(&mut self) -> Result<ManifestId> {
-        let id = self.kernel.checkpoint()?;
-        self.wal
-            .checkpoint(id)
-            .map_err(FlockError::wal("commit snapshot"))?;
-        Ok(id)
+        // The kernel commits through the store's `PageStore`, whose `commit` IS `DurableStore::commit`
+        // for a local database — the real protocol, fsync'd log record and all. There is deliberately
+        // no second WAL call here: the old code took a manifest id from `Pager::commit` (which writes
+        // no log record) and then called `Wal::checkpoint`, which is not a commit — it persists the
+        // head and *truncates the log behind it*. It worked by accident.
+        Ok(self.kernel.checkpoint()?)
+    }
+
+    /// Wait until this database is durable in object storage. Tiered databases only.
+    ///
+    /// On a local database this is a no-op that returns immediately: a local database is already
+    /// durable the moment [`snapshot`](Db::snapshot) returns, because its commit point is an fsync'd
+    /// WAL record. Calling it anyway is harmless and lets fleet code stay uniform.
+    pub async fn ensure_durable(&self) -> Result<()> {
+        match &self.store {
+            Store::Local(_) => Ok(()),
+            Store::Tiered(t) => t
+                .ensure_durable(&[t.pager().head()])
+                .await
+                .map_err(FlockError::tier("make durable in object storage")),
+        }
     }
 
     /// Fork this database. **The headline property, and the one worth being blunt about.**
     ///
-    /// The fork is a *real, separate database*. It shares every page with its parent by
-    /// construction and copies none of them. Then:
+    /// The fork is a *real, separate database*. It shares every page with its parent by construction
+    /// and copies none of them. Then:
     ///
     /// > **A write to the fork is never, under any circumstance, visible in the parent.**
     ///
-    /// That is not enforced by a check we perform, which is a much weaker claim than it sounds.
-    /// It is **structural**: a manifest is an immutable value, the fork holds a different one, and
-    /// there is no code path — no bug, no race, no `WHERE` clause someone forgot — that could make
-    /// the parent read the fork's bytes. `fork_isolation.rs` in this crate's tests asserts it at
-    /// the SQL level, as bluntly as it can be written.
+    /// That is not enforced by a check we perform, which is a much weaker claim than it sounds. It is
+    /// **structural**: a manifest is an immutable value, the fork holds a different one, and there is
+    /// no code path — no bug, no race, no `WHERE` clause someone forgot — that could make the parent
+    /// read the fork's bytes. `fork_isolation.rs` in this crate's tests asserts it at the SQL level,
+    /// as bluntly as it can be written.
     ///
     /// # This checkpoints the parent first, and it must
     ///
-    /// The parent's uncommitted writes live in a DuckDB scratch file substrate has never seen. A
-    /// fork that did not checkpoint first would branch from the parent's *last snapshot*, silently
-    /// dropping everything the caller has done since — and the caller, who has just watched their
-    /// `INSERT`s succeed, would have no reason to suspect it.
+    /// The parent's uncommitted writes live in a DuckDB scratch file substrate has never seen. A fork
+    /// that did not checkpoint first would branch from the parent's *last snapshot*, silently dropping
+    /// everything the caller has done since — and the caller, who has just watched their `INSERT`s
+    /// succeed, would have no reason to suspect it.
     ///
     /// # What it costs
     ///
@@ -230,11 +328,11 @@ impl Db {
     pub fn fork(&mut self, name: &str) -> Result<Db> {
         validate_name(name)?;
 
-        let dir = wal_dir(&self.root, name);
+        let dir = db_dir(&self.root, name);
         if dir.exists() {
-            // We will not adopt it, and adopting it is the *dangerous* option: `Wal::recover` would
-            // set the fork's head to that other database's manifest, and `fork` would return a
-            // handle full of someone else's rows while reporting complete success.
+            // We will not adopt it, and adopting it is the *dangerous* option: recovery would set the
+            // fork's head to that other database's manifest, and `fork` would return a handle full of
+            // someone else's rows while reporting complete success.
             return Err(FlockError::NameTaken {
                 name: name.to_string(),
                 path: dir,
@@ -243,26 +341,39 @@ impl Db {
 
         let head = self.snapshot()?;
 
-        // O(1). `Pager::at` shares the CAS and the manifest store — this is the fork — and gives
-        // the new database a private head.
-        let forked = Arc::new(self.pager.at(head).map_err(FlockError::pager("fork"))?);
+        // The fork's own directory — its own WAL, symlinked onto the same shared CAS as its parent.
+        // *That* is the fork: same pages, different head. Nothing is copied.
+        let dir = link_db_to_shared_cas(&self.root, name)?;
+        let forked = Arc::new(
+            DurableStore::open(std_vfs(), &dir, StoreConfig::default())
+                .map_err(FlockError::wal("open the fork's durable store"))?,
+        );
+        forked
+            .recover()
+            .map_err(FlockError::wal("replay the fork's log"))?;
 
-        // The fork's head is durable from birth. Note we do NOT call `recover()` here: the WAL is
-        // brand new, so recovery would reset the head to the empty root manifest and hand back an
-        // empty database. That is a genuinely easy mistake — it is the same call that is mandatory
-        // in `Flock::open` — and it would be caught only by a test that forks a *non-empty*
-        // database, which is why there is one.
-        let mut wal = Wal::open(std_vfs(), &dir).map_err(FlockError::wal("open fork's log"))?;
-        wal.checkpoint(head)
-            .map_err(FlockError::wal("record fork's head"))?;
+        // Position the fork at its parent's snapshot, and make that durable.
+        //
+        // `checkpoint()` is the right call here and the wrong call in `snapshot()` — it persists the
+        // current head so recovery starts from it. Without it, the fork's log is empty, recovery
+        // resets it to the empty root manifest, and reopening the fork after a restart hands back an
+        // EMPTY database. That is caught only by a test that forks a non-empty database and then
+        // reopens it, which is why there is one.
+        forked
+            .pager()
+            .set_head_to(head)
+            .map_err(FlockError::pager("position the fork at its parent"))?;
+        forked
+            .checkpoint()
+            .map_err(FlockError::wal("record the fork's head"))?;
 
-        let kernel = DuckDbKernel::open(forked.clone(), self.opts.clone())?;
+        let store = Store::Local(forked);
+        let kernel = DuckDbKernel::open(store.page_store(), self.opts.clone())?;
 
         Ok(Db {
             name: name.to_string(),
             root: self.root.clone(),
-            pager: forked,
-            wal,
+            store,
             kernel,
             opts: self.opts.clone(),
         })
@@ -271,134 +382,190 @@ impl Db {
     /// Go back to a snapshot. O(1) in substrate: a pointer moves.
     ///
     /// **Everything written since the snapshot is discarded**, including work that has not been
-    /// snapshotted at all. That is what "restore" means, it is not recoverable through this API,
-    /// and this sentence is the only warning you get — so take a [`snapshot`](Db::snapshot) first
-    /// if you might want the current state back. Snapshots are cheap and this is exactly what they
-    /// are for.
+    /// snapshotted at all. That is what "restore" means, it is not recoverable through this API, and
+    /// this sentence is the only warning you get — so take a [`snapshot`](Db::snapshot) first if you
+    /// might want the current state back. Snapshots are cheap and this is exactly what they are for.
     ///
     /// The old state is *not destroyed*: it is still a manifest, still content-addressed, still
     /// restorable if you kept its id. Nothing is deleted until GC runs and finds no live manifest
     /// referencing it.
     pub fn restore(&mut self, manifest: ManifestId) -> Result<()> {
         self.rewind_to(manifest)?;
-        // Rebuilding the kernel rehydrates the scratch file from the restored head, and drops the
-        // old connection — and with it, the old scratch file. Assigning here rather than mutating
-        // in place means a failure leaves the previous kernel untouched and usable.
-        self.kernel = DuckDbKernel::open(self.pager.clone(), self.opts.clone())?;
+        // Rebuilding the kernel rehydrates the scratch file from the restored head, and drops the old
+        // connection — and with it, the old scratch file. Assigning here rather than mutating in place
+        // means a failure leaves the previous kernel untouched and usable.
+        self.kernel = DuckDbKernel::open(self.store.page_store(), self.opts.clone())?;
         Ok(())
     }
 
-    /// Put the database to sleep, releasing its SQL engine, its threads, and its scratch file.
+    /// **Put the database to sleep in object storage**, and hand back the pointer that is all that
+    /// remains of it.
     ///
-    /// Consumes the handle, because after this there is no database in memory — only a
-    /// [`WakeToken`], which is a name and 32 bytes. Bring it back with [`Flock::wake`].
+    /// Every page and the manifest's whole ancestry go to the bucket; the SQL engine, its threads and
+    /// its scratch file are released. What is left is a [`WakeToken`] — a pool, a 32-byte manifest id,
+    /// and a page size. That is the entire database, as far as anything else is concerned, which is
+    /// why a million sleeping databases fit in a registry on a laptop (docs/02 §9.3).
     ///
-    /// It checkpoints first, so nothing is lost.
+    /// Consumes the handle, because after this there is no database in memory.
     ///
-    /// # Read the `wake` module before you believe this does what you think
+    /// # It snapshots first
     ///
-    /// F1's sleep releases **compute**. It does **not** upload anything to object storage — the
-    /// pages stay in the local CAS, so a sleeping F1 database still occupies its bytes on local
-    /// disk. The <250 ms cold wake from S3 in docs/02 §7 is F3 work and is **not measured here**,
-    /// because the substrate API that would do it is not published yet. Details, including exactly
-    /// which substrate types are missing, are in the `wake` module docs.
-    pub fn sleep(mut self) -> Result<WakeToken> {
-        let manifest = self.snapshot()?;
-        Ok(WakeToken::new(self.root, self.name, manifest))
+    /// So nothing written since the last snapshot is lost.
+    ///
+    /// # This must run on a multi-threaded tokio runtime
+    ///
+    /// See [`Flock::wake`] for why a current-thread runtime deadlocks rather than erroring.
+    ///
+    /// # What it does NOT do: delete your local pages
+    ///
+    /// The pool's CAS is left exactly as it was. Sleeping frees *compute*, and puts a durable copy in
+    /// object storage; it does not reclaim local disk. Reclaiming it means garbage-collecting pages
+    /// that no live manifest references, which is [`substrate_pager::PageStore::gc`]'s job and is a
+    /// fleet-level policy decision (F4), not something a single `sleep()` call should take upon
+    /// itself while the caller is not looking.
+    ///
+    /// # The trap underneath this, which cost an afternoon to find
+    ///
+    /// The obvious implementation is to open a [`TieredStore`] directly on the pool's CAS and call
+    /// [`TieredStore::sleep`]. **That destroys the pool.**
+    ///
+    /// `TieredCas` tracks which pages are `pending` upload, and it learns that by watching pages go
+    /// *through* it. Open one over a CAS that already has pages in it — pages a `DurableStore` wrote,
+    /// which it never saw — and `pending` is empty. `flush()` then uploads *nothing*, believing there
+    /// is nothing to upload; `drop_local()` checks that `pending` is empty, concludes everything is
+    /// safely in the bucket, and **deletes every page in the pool**. The manifests upload fine, so you
+    /// are left with a bucket full of manifests pointing at pages that exist nowhere, and a local CAS
+    /// that has been emptied. Every database in the pool, gone, with a successful return code.
+    ///
+    /// So we never point a `TieredStore` at the pool. We open one on a throwaway staging directory and
+    /// *copy* the pages into it — through `TieredCas::put`, which is what marks them `pending` and is
+    /// therefore what makes `flush()` actually upload them. The staging directory is ours, it holds
+    /// nothing unique, and `drop_local()` is welcome to it.
+    pub async fn sleep(mut self, remote: RemoteTier) -> Result<WakeToken> {
+        let head = self.snapshot()?;
+        let page_size = self.store.pager().page_size();
+
+        // Release the SQL engine before we do any I/O: the point of sleeping is to stop paying for
+        // compute, and there is no reason to hold a DuckDB connection open through an upload.
+        drop(self.kernel);
+
+        // A staging store we own and will throw away. NOT the pool — see the trap above.
+        let staging =
+            tempfile::tempdir().map_err(FlockError::pool("stage for sleep", &self.root))?;
+        let config = StoreConfig {
+            page_size,
+            pool: remote.pool().to_string(),
+            ..StoreConfig::default()
+        };
+        let tiered = TieredStore::open(staging.path(), remote, config)
+            .await
+            .map_err(FlockError::tier("open the staging store"))?;
+
+        let src = self.store.page_store();
+        let dst_cas = tiered.pager().cas();
+        let dst_manifests = tiered.pager().manifest_store();
+
+        // Walk the head's ancestry: the overlay chain it resolves through (the STORAGE edge — without
+        // it the manifest cannot be read at all) and the parents that are its history (the HISTORY
+        // edge — without it, every snapshot id the caller is holding stops working after a wake).
+        //
+        // Copying the manifests *by value* keeps their ids: a manifest id is a hash of its bytes, and
+        // these are the same bytes. That is what lets a `ManifestId` taken before a sleep still be a
+        // valid argument to `restore` after the wake. Re-deriving the manifests instead would have
+        // been easier and would have silently changed every id.
+        let mut seen: HashSet<ManifestId> = HashSet::new();
+        let mut stack = vec![head];
+        let mut page_ids: HashSet<_> = HashSet::new();
+
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let manifest = src
+                .manifest(&id)
+                .map_err(FlockError::pager("read manifest"))?;
+
+            // Every page this manifest can see, not merely the ones it changed — so that restoring to
+            // an older snapshot after a wake finds its pages there.
+            for page_id in src
+                .resolve(&id)
+                .map_err(FlockError::pager("resolve manifest"))?
+                .into_values()
+            {
+                page_ids.insert(page_id);
+            }
+
+            dst_manifests
+                .put(&manifest)
+                .map_err(FlockError::pager("stage manifest"))?;
+
+            if let Some(base) = manifest.overlay_base() {
+                stack.push(base);
+            }
+            if let Some(parent) = manifest.parent {
+                stack.push(parent);
+            }
+        }
+
+        // The pages, through `TieredCas::put` — which is the whole point. This is what marks them
+        // `pending`, and `pending` is what `flush()` uploads.
+        let src_cas = self.store.pager().cas();
+        for page_id in page_ids {
+            let page = src_cas
+                .get(page_id)
+                .map_err(FlockError::pager("read page for upload"))?;
+            dst_cas
+                .put(&page)
+                .map_err(FlockError::pager("stage page for upload"))?;
+        }
+
+        tiered
+            .pager()
+            .set_head_to(head)
+            .map_err(FlockError::pager("position the staging store"))?;
+
+        // Flush the pages, upload the manifest ancestry, drop the staging cache. If the flush fails,
+        // substrate drops nothing and errors — a sleep that loses data is a bug with good marketing.
+        tiered.sleep().await.map_err(FlockError::tier("sleep"))
     }
 
-    /// Write a vanilla `.duckdb` file. **The escape hatch** (docs/02 §6.2).
+    /// Export to a **plain, standard `.duckdb` file** with no dependency on FlockDB.
     ///
-    /// This is a product decision, not a feature. The largest objection to adopting a new storage
-    /// engine is *"what if you disappear, or I hate you"* — and the answer has to be one command
-    /// that hands over the data in a format with an ecosystem and no dependency on us. Anything
-    /// less makes us a hostage-taker, and serious buyers can smell it.
+    /// This is the escape hatch, and it is a product decision rather than a feature. The largest
+    /// objection to adopting a new storage engine is *"what if you disappear, or I hate you"*, and
+    /// the answer has to be one command that hands the data back in a format with an ecosystem.
+    /// Anything less makes us a hostage-taker, and serious buyers can smell it.
     ///
-    /// The file it writes has never heard of FlockDB. Open it with the `duckdb` CLI, with
-    /// `import duckdb` in Python, with a BI tool. There is no import step and no "FlockDB
-    /// compatibility mode", because there is nothing of ours in it.
+    /// Open the result with the `duckdb` CLI, with Python, with a BI tool. There is no import step and
+    /// no compatibility mode, because there is nothing of ours in it. CLAUDE.md rule 4 tests this on
+    /// every commit against a *stock* DuckDB connection that has never heard of FlockDB — a test that
+    /// proved only *we* can read our own export would prove nothing.
     ///
-    /// It exports **what you can see right now**, including writes since the last snapshot — it
-    /// reads through the live DuckDB connection, so it does not depend on the page sync having run.
-    /// That matters: the moment you most want an export is the moment you least trust the rest of
-    /// the system.
-    ///
-    /// It refuses to overwrite an existing file. Tested on every commit, against a fresh DuckDB
-    /// connection that has never heard of us, so that it cannot rot into a claim we stopped
-    /// checking.
-    ///
-    /// ```no_run
-    /// # fn main() -> Result<(), flock_core::FlockError> {
-    /// # let mut db = flock_core::Flock::open("/tmp/pool", "sales")?;
-    /// db.export_duckdb("/tmp/sales-i-can-take-with-me.duckdb")?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Refuses to overwrite an existing file.
     pub fn export_duckdb(&mut self, path: impl AsRef<Path>) -> Result<()> {
         Ok(self.kernel.export(path.as_ref())?)
     }
 
-    /// Run several statements as one script.
-    ///
-    /// Outside docs/02 §5.3's frozen surface, and here because the alternative is every caller
-    /// splitting SQL on semicolons — which breaks the first time a string literal contains one.
-    pub fn execute_batch(&mut self, sql: &str) -> Result<()> {
-        Ok(self.kernel.execute_batch(sql)?)
-    }
-
-    /// The manifest this database is currently sitting on, without taking a snapshot.
-    ///
-    /// Note this is the head as substrate knows it — i.e. as of the last [`snapshot`](Db::snapshot),
-    /// **not** including writes still sitting in DuckDB's scratch file.
-    pub fn head(&self) -> ManifestId {
-        self.pager.head()
-    }
-
-    /// Move the store's head, checking the manifest exists and recording the move durably.
     fn rewind_to(&mut self, manifest: ManifestId) -> Result<()> {
-        self.pager.rewind(&manifest).map_err(|e| match e {
-            // Substrate says "missing manifest"; the caller needs to hear "that is not a snapshot
-            // of a database in this pool", which is a different and much more actionable sentence.
-            substrate_pager::PagerError::MissingManifest(_) => {
-                FlockError::UnknownSnapshot { manifest }
-            }
-            source => FlockError::Pager {
-                op: "restore",
-                source,
-            },
-        })?;
-        self.wal
-            .checkpoint(manifest)
-            .map_err(FlockError::wal("record restored head"))?;
+        let store = self.store.page_store();
+
+        // Refuse a manifest this pool has never seen, rather than discovering it three layers down as
+        // a missing page. A `ManifestId` is 32 opaque bytes; the caller may well have got one from the
+        // wrong pool, and the error should say so.
+        store
+            .manifest(&manifest)
+            .map_err(|_| FlockError::UnknownSnapshot { manifest })?;
+
+        store
+            .rewind(&manifest)
+            .map_err(FlockError::pager("restore"))?;
+
+        // Make the new head durable, so a restart lands here and not back where we were. `checkpoint`
+        // persists the current head — this is the one place it is the right call.
+        if let Store::Local(d) = &self.store {
+            d.checkpoint()
+                .map_err(FlockError::wal("record the restored head"))?;
+        }
         Ok(())
     }
-
-    /// `restore`, but consuming and returning `self` — for [`Flock::wake`], which has a `Db` it has
-    /// just built and wants positioned at a token's manifest before anyone sees it.
-    fn restore_into(mut self, manifest: ManifestId) -> Result<Db> {
-        self.restore(manifest)?;
-        Ok(self)
-    }
-}
-
-/// Open the pool's shared page store.
-///
-/// The pool name is the *directory name*, which makes it visible in a path, in a mount, and in an
-/// `ls` — an operator who needs to know which classification boundary a directory belongs to should
-/// not have to run a query to find out.
-fn open_pager(root: &Path) -> Result<Pager> {
-    let pages = pages_dir(root);
-    let pool = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "default".to_string());
-
-    Pager::open(
-        &pages,
-        StoreConfig {
-            pool,
-            ..StoreConfig::default()
-        },
-    )
-    .map_err(FlockError::pager("open pool"))
 }

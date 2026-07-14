@@ -31,15 +31,35 @@ We would rather you read this here than find it in a POC. This section is the po
 | **Fork isolation at the SQL level** | **Real, and structural.** Not "we check" — a manifest is an immutable value and the fork holds a different one. 9 tests. |
 | **Snapshot / restore round-trip** | **Real.** O(1) in substrate — a snapshot is a 32-byte content hash. |
 | **`export_duckdb` writes a vanilla `.duckdb` file** | **Real.** Tested every commit by opening it with a *stock* `duckdb::Connection` that has never heard of us. |
-| **A snapshot survives a crash** | **Real.** The commit point is an fsync'd WAL record. |
+| **A snapshot survives a crash** | **Real.** The commit point is an fsync'd WAL record, written by substrate's `DurableStore` — the path with 50,000 randomized crash-and-recover cycles behind it. We do not order the commit ourselves. (We used to. See below.) |
+| **`sleep()` puts a database in object storage** | **Real.** Pages and the manifest's whole ancestry go to the bucket. Every tiering test **deletes the entire pool directory** between `sleep()` and `wake()`, so the data cannot be coming from anywhere else. |
+| **A snapshot id still works after a sleep/wake** | **Real.** `sleep()` copies manifests by value, so their content hashes — their ids — survive the round trip. |
 | **TPC-H SF0.1 < 15 % over raw DuckDB** (docs/02 §7) | **Measured.** See below. |
 | *Writes between snapshots* are durable | **No.** They live in a DuckDB scratch file. A crash takes them. |
 | `fork()` is O(1) end to end | **No.** O(1) in substrate; **O(database) in the kernel**, which must hydrate a file for DuckDB. |
 | `query()` streams results | **No.** F1 materialises them. The type is named `ArrowStream` because the API is frozen; the laziness is F2. |
-| `sleep()` hibernates a database into object storage | **No.** F1's sleep releases *compute*. Nothing is uploaded. |
-| Wake from S3 in < 250 ms (docs/02 §7) | **Not measured.** The substrate API that would do it is not published yet. Not "measured and passing" — *not measured*. |
+| **Wake is lazy** — fetch only the pages a query touches | **No, and it cannot be in F1.** Substrate's wake *is* lazy. FlockDB defeats it: DuckDB needs a whole file, so waking reconstructs the database and therefore downloads **all of it**. Waking a 100 GB database moves 100 GB. |
+| **Wake from S3 in < 250 ms (docs/02 §7)** | **NOT MEASURED**, and the floor below suggests it is in trouble. Not "measured and passing". *Not measured.* |
 
 Every "No" in that table has the same root cause, and it is worth stating once.
+
+## The other thing we got wrong, and fixed
+
+The first version of this engine used substrate's `Pager` directly and **hand-ordered the commit
+protocol**: pages into the CAS, install the manifest, then append a WAL record. Substrate's actual
+protocol puts the fsync'd WAL record *before* the install — that record **is** the commit point.
+Worse, the "append" was `Wal::checkpoint()`, which is not a commit at all: it persists the head and
+*truncates the log behind it*. Every snapshot silently threw the log away.
+
+It worked. That is the problem with it. It was "probably safe, by my reading, with no crash-injection
+harness" — and that is not a sentence anyone should accept about a storage engine.
+
+It now commits through **`substrate_wal::DurableStore`**, the path with **50,000 randomized
+crash-and-recover cycles** behind it, which kill the write path at every byte boundary in turn and
+which found three real bugs when substrate ran them. We do not order the commit. It does.
+
+`crates/flock-core/src/store.rs` is the adapter, and `many_snapshots_in_a_row_all_replay_after_the_process_dies`
+is the test that keeps it honest.
 
 ## The one engineering decision that explains everything
 
@@ -133,6 +153,32 @@ forks of a template still cost one template.
 A benchmark suite that only measured the operation we are fast at would be marketing, so
 `benches/tpch.rs` measures both and prints both.
 
+### Wake latency — the target we did NOT measure, and why we think it is in trouble anyway
+
+docs/02 §7 wants **p99 wake-to-first-query < 250 ms**. We could not measure it: this machine had no
+S3-compatible endpoint (the Docker daemon would not start, and pulling the MinIO binary was
+refused). So the number does not exist, and we are not going to imply otherwise. There is an
+`#[ignore]`d test, `wake_latency_against_a_real_s3_endpoint`, that produces it in one command the
+moment anyone has a bucket — a mechanism, rather than a promise to measure it later.
+
+What we *can* measure is the **floor**: the same operation against an in-process object store, which
+is to say with the network latency set to exactly zero.
+
+| Database | `Flock::open` from local pool → first query | **`Flock::wake` → first query** (zero-latency object store) |
+| --- | --- | --- |
+| 1 k rows (~210 KB) | 20 ms | **95 ms** |
+| 100 k rows (~210 KB) | 17 ms | **79 ms** |
+| 1 M rows (~800 KB) | 31 ms | **199 ms** |
+
+Read the right-hand column again. On a **sub-megabyte** database, with an object store that responds
+instantly, waking already costs 79–199 ms of a 250 ms budget. Every real network round trip is on
+top of that — and because FlockDB's wake is **O(database)** rather than O(pages touched), there is
+one such fetch for *every page in the database*, not for the few a query needs.
+
+We do not think this target is reachable in F1, and the reason is not substrate: substrate's wake is
+lazy and would meet it. It is the same fallback as everything else on this page — **DuckDB needs a
+whole file before it will answer anything.** We would rather say that now than discover it in a POC.
+
 ---
 
 ## Quick start
@@ -156,6 +202,28 @@ db.export_duckdb("/tmp/mine.duckdb")?;   // and here is your data, with no strin
 
 Results are [Arrow](https://arrow.apache.org/) `RecordBatch`es, not a bespoke row format.
 
+### Sleep and wake
+
+```rust
+use flock_core::{Flock, RemoteTier, object_store::aws::AmazonS3Builder};
+
+let bucket = AmazonS3Builder::new().with_bucket_name("tenants").build()?;
+let tier = RemoteTier::new(std::sync::Arc::new(bucket), "acme");   // "acme" is the POOL
+
+// Everything goes to object storage. What's left is a token: a pool, 32 bytes, a page size.
+let token: WakeToken = db.sleep(tier.clone()).await?;
+
+// …a month later, on a different machine, into an empty directory:
+let mut db = Flock::wake("/var/cache/flock", "sales", tier, &token).await?;
+db.query("SELECT count(*) FROM t")?;
+```
+
+A `WakeToken` is the whole database as far as anything else is concerned, which is why a million
+sleeping databases fit in a registry on a laptop. **`sleep`/`wake` need a multi-threaded tokio
+runtime** — substrate's read path is synchronous by design, so a cache miss blocks on an async fetch,
+and a current-thread runtime deadlocks rather than erroring. And read the wake-latency section above
+before you plan around this: waking is O(database), not O(what you query.)
+
 ## The escape hatch
 
 `Db::export_duckdb(path)` writes a **vanilla, standard `.duckdb` file** with no dependency on
@@ -174,9 +242,20 @@ back in a format with an ecosystem. Anything less makes us a hostage-taker.
 crates/
   flock-kernel/   the SqlKernel trait, the DuckDB implementation, and the page marshalling
   flock-core/     Flock, Db — the public API. Durability, forks, snapshots, the escape hatch.
-    tests/        SQL smoke · fork isolation · snapshot/restore · export-to-stock-DuckDB
+    store.rs      WHERE THE COMMIT POINT IS. Routes commits through substrate's DurableStore.
+    pool.rs       the on-disk layout, and why there are symlinks in a storage engine
+    tests/        SQL smoke · fork isolation · snapshot/restore · export-to-stock-DuckDB · tiering
     benches/      TPC-H SF0.1, full stack vs raw DuckDB
 ```
+
+**On the symlinks.** A pool keeps one shared CAS (`cas/pages`, `cas/manifests`) and gives each
+database a private WAL (`dbs/<name>/wal`); each database's `pages`/`manifests` are symlinks into the
+shared CAS. That shape is forced: substrate's `DurableStore` takes **one directory** and puts the CAS
+and the WAL both inside it, which cannot express *"many databases, one CAS, a WAL each"* — and that
+is the only shape FlockDB has. Give each database its own directory and a fork copies every page;
+point two of them at one directory and they share a WAL and corrupt each other's head. The proper fix
+is a `DurableStore::from_parts(pager, wal)` upstream. Until then, a symlink is the boring answer, and
+it beats hand-rolling the commit protocol a second time.
 
 `flock-*` may depend on `substrate-*`. It may **never** depend on `loom-*`
 ([LoomDB](https://github.com/Bobcatsfan33/loomdb) is the other product on the same engine). The
@@ -187,8 +266,9 @@ engine means the on-disk format can change without a version bump.
 
 ```bash
 cargo test --workspace                      # DuckDB is compiled from source (bundled). No system lib.
+cargo test --workspace --features airgap    # must pass with no network
 cargo clippy --workspace --all-targets -- -D warnings
-cargo bench -p flock-core --features tpch   # slow: CMake build of DuckDB. No network.
+cargo bench -p flock-core --features tpch   # fetches DuckDB's TPC-H extension once (network)
 ```
 
 The first build compiles DuckDB from source and takes several minutes.
