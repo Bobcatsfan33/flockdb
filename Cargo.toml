@@ -1,0 +1,52 @@
+[workspace]
+members = ["crates/flock-kernel", "crates/flock-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/Bobcatsfan33/flockdb"
+
+[workspace.dependencies]
+# Substrate is a dependency, not a destination (docs/02 §5). Pinned to a tag, never a branch:
+# a moving dependency under a storage engine means the on-disk format can change without a
+# version bump, and a store written on Tuesday stops opening on Wednesday.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+
+# `bundled` compiles DuckDB from source and links it statically. No system library, no
+# `LD_LIBRARY_PATH`, and — the reason that matters here — no network at run time, which is what
+# CLAUDE.md rule 5 (airgap) requires.
+duckdb = { version = "1.10504", features = ["bundled"] }
+
+thiserror = "2"
+tempfile = "3"
+criterion = "0.5"
+
+# ── Build DuckDB itself optimized, in every profile ─────────────────────────────────────────────
+#
+# `bundled` compiles ~350,000 lines of C++ that we never debug, never change, and did not write.
+# Left on the dev profile's defaults it is built `-O0 -g`, which costs **6.9 GB of `target/`** (a
+# 1.4 GB rlib, statically re-linked into every test binary), and makes the test suite slower than
+# the storage engine it is testing. Neither buys anything: a stack frame inside DuckDB's optimizer
+# is not a frame we are going to act on.
+#
+# So: optimized, no symbols, everywhere. Our own crates keep their debug info — those frames we do
+# act on. This is not a micro-optimisation, it is the difference between a repo that fits on a
+# laptop and one that does not.
+[profile.dev.package.libduckdb-sys]
+opt-level = 2
+debug = false
+
+[profile.test.package.libduckdb-sys]
+opt-level = 2
+debug = false
+
+# Benchmarks profile our code, so our code keeps its symbols.
+[profile.bench]
+debug = true
+
+[profile.bench.package.libduckdb-sys]
+debug = false

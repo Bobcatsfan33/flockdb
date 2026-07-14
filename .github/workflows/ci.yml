@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A storage engine's CI must fail on a warning, not accumulate them until nobody reads the output.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # fmt is its own job because it needs no build. It should fail in twenty seconds, not after the
+  # eight minutes it takes to compile DuckDB from source.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets so that tests and benches are linted too. A `unwrap()` that only exists in a
+      # benchmark still ships in the repository, and a lint that does not look at the code people
+      # copy from is a lint with a blind spot.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # This runs `export_duckdb`'s tests, which open the exported file with a stock
+      # duckdb::Connection. That is the escape hatch (docs/02 §6.2), it is a product promise rather
+      # than a feature, and it is checked here on every commit precisely so that it cannot rot.
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  # CLAUDE.md rule 5 in substrate: everything must compile and pass with networking amputated at
+  # compile time. Nothing in FlockDB reaches the network — this job is what keeps that true rather
+  # than merely currently-true.
+  airgap:
+    name: test --features airgap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --features airgap
+
+  # The performance target from docs/02 §7 (< 15 % over raw DuckDB on TPC-H SF0.1).
+  #
+  # It does NOT gate the merge, and that is deliberate. A shared CI runner is a terrible place to
+  # enforce a 15 % threshold: our own laptop shows a per-round spread of ±20 %, which is larger than
+  # the thing being measured. A benchmark that fails randomly is a benchmark everyone learns to
+  # ignore, and then it is worse than no benchmark, because it is still believed.
+  #
+  # It runs on every commit so the number stays VISIBLE in the log and the benchmark cannot rot.
+  # Judging a regression is a human's job, against the median of paired ratios that it prints.
+  #
+  # This is the one job that uses the network: it fetches DuckDB's official TPC-H extension. The
+  # `airgap` job above is what proves the *library* does not.
+  bench:
+    name: TPC-H SF0.1 (informational, not a gate)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p flock-core --features tpch --bench tpch -- --warm-up-time 2 --measurement-time 10

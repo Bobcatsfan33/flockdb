@@ -1,0 +1,41 @@
+[package]
+name = "flock-kernel"
+description = "The SqlKernel trait and its DuckDB implementation: the SQL engine FlockDB hosts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "duckdb", "sql", "olap", "arrow"]
+categories = ["database-implementations"]
+
+[dependencies]
+substrate-pager.workspace = true
+duckdb.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+# CLAUDE.md rule 5. Nothing in this crate reaches the network, so the flag is a no-op here — but
+# it must EXIST, or `cargo test --workspace --features airgap` fails to resolve and the airgap
+# gate silently stops running.
+airgap = []
+
+# NOTE — `duckdb/tpch` is NOT usable, and we tried.
+#
+# duckdb-rs advertises a `tpch` feature that statically links DuckDB's TPC-H extension, which would
+# let the benchmark generate its data with no network at all. It does not work from crates.io:
+# `tpch` implies `bundled-cmake`, and `libduckdb-sys`'s CMake build script requires
+# `duckdb-sources/CMakeLists.txt` — a directory that exists only in a *git checkout* of duckdb-rs.
+# The published .crate ships `duckdb.tar.gz` for the `cc` path and nothing for the CMake path, so
+# enabling the feature panics in the build script:
+#
+#     `bundled-cmake` requires a duckdb-rs checkout with DuckDB sources at duckdb-sources/CMakeLists.txt
+#
+# That is an upstream packaging bug, not something we can configure around. The benchmark therefore
+# loads the official TPC-H extension at run time instead (`INSTALL tpch`), which needs the network
+# once. See `flock-core`'s `tpch` feature and `benches/tpch.rs` for the honest consequences.

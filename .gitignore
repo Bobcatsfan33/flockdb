@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo.lock IS committed, deliberately. This is a storage engine: "which exact substrate did this
+# store's format come from" must be answerable years later, and a lockfile is the only thing that
+# answers it. The modern advice to commit lockfiles even for libraries applies double here.
+
+# Criterion output
+/target/criterion/
+
+# macOS
+.DS_Store
+
+# Scratch databases a stray test or a manual experiment might leave behind. FlockDB's own scratch
+# files live in a TempDir and delete themselves; these are for the ones a human made by hand.
+*.duckdb
+*.duckdb.wal
