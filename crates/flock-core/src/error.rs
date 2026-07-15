@@ -132,6 +132,20 @@ pub enum FlockError {
         source: substrate_store::StoreError,
     },
 
+    /// Replication said no — shipping a primary's WAL, or applying it on a replica.
+    ///
+    /// The source is boxed: `SyncError` carries several hex-string fields, and inlining it here would
+    /// bloat `FlockError` — and therefore every `Result` in the crate, and the CLI's `CliError` on
+    /// top of it — past the size at which `clippy::result_large_err` (rightly) complains. A box keeps
+    /// the common, non-error `Ok` path small, which is the path that runs.
+    #[error("replication failed during {op}: {source}")]
+    Sync {
+        /// What FlockDB was doing.
+        op: &'static str,
+        /// flock-sync's account of it.
+        source: Box<flock_sync::SyncError>,
+    },
+
     /// A thing this platform cannot do.
     #[error("{what} is not supported: {why}")]
     Unsupported {
@@ -153,6 +167,13 @@ impl FlockError {
 
     pub(crate) fn tier(op: &'static str) -> impl Fn(substrate_store::StoreError) -> FlockError {
         move |source| FlockError::Tier { op, source }
+    }
+
+    pub(crate) fn sync(op: &'static str) -> impl Fn(flock_sync::SyncError) -> FlockError {
+        move |source| FlockError::Sync {
+            op,
+            source: Box::new(source),
+        }
     }
 
     pub(crate) fn pool(

@@ -968,6 +968,7 @@ dependencies = [
  "criterion",
  "duckdb",
  "flock-kernel",
+ "flock-sync",
  "object_store",
  "substrate-pager",
  "substrate-store",
@@ -994,6 +995,18 @@ dependencies = [
  "arrow",
  "flock-core",
  "pyo3",
+]
+
+[[package]]
+name = "flock-sync"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "substrate-pager",
+ "substrate-wal",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,0 +1,40 @@
+[package]
+name = "flock-sync"
+description = "WAL shipping, read replicas, and point-in-time restore for FlockDB, built on substrate's fsync'd commit log."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "replication", "wal", "replica", "backup"]
+categories = ["database-implementations"]
+
+[dependencies]
+# flock-sync is a pure replication engine over substrate's page store and WAL. It deliberately does
+# NOT depend on flock-kernel / DuckDB: the load-bearing correctness (a replica byte-identical to its
+# primary) lives here and is proven by a differential oracle that runs thousands of cases, and that
+# oracle stays fast and deterministic precisely because there is no SQL engine underneath it.
+substrate-pager.workspace = true
+substrate-wal.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Proves a `Shipment` survives a round trip through an ordinary wire format — i.e. it really can be
+# sent to a follower over a socket, not merely held in the same process.
+serde_json.workspace = true
+# `test-util` exposes substrate's in-memory `MemVfs`. The differential oracle runs thousands of
+# primary/follower pairs, and on a real disk that is thousands of fsyncs (minutes); on `MemVfs` the
+# same coverage is seconds, and a dropped-but-not-cleared `MemVfs` models a process crash whose disk
+# survives — exactly the crash-and-resume the oracle needs. Test scaffolding only; no library build
+# sees it.
+substrate-pager = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
+# CLAUDE.md rule 5 (substrate) / flockdb parity. Nothing in this crate reaches the network — the
+# only bytes it touches are the primary's local WAL segments and CAS — so the flag is a no-op here.
+# But it must EXIST, or `cargo test --workspace --features airgap` fails to resolve for this member
+# and the airgap gate silently stops running for the whole workspace.
+airgap = []

@@ -38,6 +38,13 @@ We would rather you read this here than find it in a POC. This section is the po
 | **`sleep()` puts a database in object storage** | **Real.** Pages and the manifest's whole ancestry go to the bucket. Every tiering test **deletes the entire pool directory** between `sleep()` and `wake()`, so the data cannot be coming from anywhere else. |
 | **A snapshot id still works after a sleep/wake** | **Real.** `sleep()` copies manifests by value, so their content hashes — their ids — survive the round trip. |
 | **TPC-H SF0.1 < 15 % over raw DuckDB** (docs/02 §7) | **Measured.** See below. |
+| **A read replica converges on its primary byte-for-byte** (F3) | **Real, and differentially proven.** A follower applies the primary's fsync'd WAL commit records and lands on the *same manifest id* — so the same bytes — at every commit it catches up to. A model oracle checks this against ~10 000 randomized primary/follower runs, at every prefix, plus random point-in-time restore and crash-and-resume. See `crates/flock-sync`. |
+| **Point-in-time restore to an LSN** (F3) | **Real.** Replay the shipped log to a chosen LSN and stop; the result is exactly the primary's state as of that LSN, reproducibly. |
+| **A read replica serves SQL** (F3) | **Real.** `ReadReplica` puts DuckDB over a follower store and answers queries at a consistent, whole-manifest snapshot that advances only on an explicit `refresh`. |
+| Read replicas are *eventually* consistent | **Yes — say it out loud.** A follower lags the primary by whatever it has not pulled. Reads are self-consistent and monotonic on one follower, but a client reading primary-then-follower can see the follower behind. Not synchronous replication. |
+| **Automatic failover** if the primary dies (F3) | **No.** Promotion is a *manual* operation. F3 ships the mechanism — a follower is a fully-formed durable database — not the orchestration that detects a dead primary and elects a new one. |
+| **Split-brain protection** (F3) | **No.** Nothing yet prevents two processes from both accepting writes as "the primary". There is no lease, fence, or quorum. flock-sync *notices* a fork after the fact; it does not *prevent* one. That fencing layer is future work, stated here so it is not a silent gap. |
+| A lagging follower can always catch up | **No, bounded.** Catch-up re-reads the log from its start, and if the primary checkpoints away history a follower still needs, that follower must be re-seeded. Bound follower lag to the primary's checkpoint cadence. |
 | *Writes between snapshots* are durable | **No.** They live in a DuckDB scratch file. A crash takes them. |
 | `fork()` is O(1) end to end | **No.** O(1) in substrate; **O(database) in the kernel**, which must hydrate a file for DuckDB. |
 | `query()` streams results | **No.** F1 materialises them. The type is named `ArrowStream` because the API is frozen; the laziness is F2. |
@@ -300,9 +307,23 @@ crates/
   flock-core/     Flock, Db — the public API. Durability, forks, snapshots, the escape hatch.
     store.rs      WHERE THE COMMIT POINT IS. Routes commits through substrate's DurableStore.
     pool.rs       the on-disk layout, and why there are symlinks in a storage engine
-    tests/        SQL smoke · fork isolation · snapshot/restore · export-to-stock-DuckDB · tiering
+    replica.rs    ReadReplica — a follower that serves SQL of a replicated primary (F3)
+    tests/        SQL smoke · fork isolation · snapshot/restore · export-to-stock-DuckDB · tiering · replica
     benches/      TPC-H SF0.1, full stack vs raw DuckDB
+  flock-sync/     WAL shipping, read replicas, point-in-time restore (F3), on substrate's WAL.
+    source.rs     WalSource — the primary side: fold the fsync'd WAL into shippable transactions
+    replica.rs    Replica — the follower side: apply shipped commits, converge byte-for-byte
+    shipment.rs   the wire unit: a durable commit record plus the pages it references
+    tests/        oracle.rs (the differential model) · shipping.rs (one test per capability)
 ```
+
+**On replication and its limits.** flock-sync ships the *durable commit record* substrate already
+fsync'd — not a re-derived diff — and a follower re-derives each manifest through substrate's own
+commit protocol, refusing to advance if it does not match. It is honest, log-shipped, eventually
+consistent read replication with **manual** failover and **no** split-brain protection yet. The
+`crates/flock-sync/src/lib.rs` header states the consistency model and every weakness in full; the
+table above summarises it. Under-promising here is deliberate: a correct "eventually consistent read
+replica, manual failover" is worth more than an "HA cluster" that is not one.
 
 **On the symlinks.** A pool keeps one shared CAS (`cas/pages`, `cas/manifests`) and gives each
 database a private WAL (`dbs/<name>/wal`); each database's `pages`/`manifests` are symlinks into the

@@ -2,6 +2,7 @@
 members = [
     "crates/flock-kernel",
     "crates/flock-core",
+    "crates/flock-sync",
     "crates/flock-cli",
     "bindings/python",
 ]

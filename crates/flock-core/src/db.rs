@@ -4,6 +4,7 @@ use crate::error::{FlockError, Result};
 use crate::pool::{db_dir, link_db_to_shared_cas, validate_name};
 use crate::store::Store;
 use flock_kernel::{ArrowStream, DuckDbKernel, KernelOpts, SqlKernel};
+use flock_sync::WalSource;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -213,6 +214,41 @@ impl Db {
     /// The manifest this database currently *is*.
     pub fn head(&self) -> ManifestId {
         self.store.head()
+    }
+
+    /// A [`WalSource`] over this database's committed WAL, for shipping it to read replicas.
+    ///
+    /// The source reads the commit records substrate has already fsync'd — the commit point itself
+    /// (docs/02 §3.1) — and the pages they reference, and hands them out as [`Shipment`](flock_sync::Shipment)s
+    /// a follower applies to converge on this database byte-for-byte. See the `flock-sync` crate for
+    /// the consistency model, and for the honest limits: replicas are eventually consistent, failover
+    /// is manual, and nothing yet prevents split-brain.
+    ///
+    /// # Only a local database can ship a WAL
+    ///
+    /// A database opened by [`Flock::open`] has a real, local write-ahead log to ship. A database
+    /// restored by [`Flock::wake`] does **not** — its durability is object storage, not a local
+    /// commit log (see [`store`](crate::Db::head) and `store.rs`) — so there is no WAL to stream, and
+    /// this returns [`FlockError::Unsupported`] rather than inventing one. Replicate a tiered database
+    /// at the object-storage layer, or ship from the local primary it was slept from.
+    pub fn wal_source(&self) -> Result<WalSource> {
+        match &self.store {
+            Store::Local(durable) => {
+                let pager = durable.pager();
+                Ok(WalSource::open(
+                    std_vfs(),
+                    db_dir(&self.root, &self.name),
+                    pager.cas(),
+                    pager.page_size(),
+                ))
+            }
+            Store::Tiered(_) => Err(FlockError::Unsupported {
+                what: "WAL shipping from a woken (object-storage-backed) database",
+                why: "a tiered database has no local write-ahead log — its durability is the bucket, \
+                      not a shippable commit record. Ship from the local primary this database was \
+                      slept from, or replicate at the object-storage layer.",
+            }),
+        }
     }
 
     /// Run a query. Results come back as Arrow (docs/02 §6.1).

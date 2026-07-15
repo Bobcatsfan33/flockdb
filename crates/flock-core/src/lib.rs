@@ -68,10 +68,16 @@
 mod db;
 mod error;
 mod pool;
+mod replica;
 mod store;
 
 pub use db::{Db, Flock};
 pub use error::{FlockError, Result};
+pub use replica::ReadReplica;
+
+// Re-exported so a caller can drive replication — build a `Db::wal_source`, hand `Shipment`s to a
+// `ReadReplica` — without separately depending on `flock-sync` and pinning the same versions.
+pub use flock_sync::{self, Shipment, SyncError, WalSource};
 
 // Re-exported so a caller can name a snapshot's type, and the Arrow types a query returns, without
 // separately depending on substrate or on the exact `arrow` version DuckDB was built against. A
