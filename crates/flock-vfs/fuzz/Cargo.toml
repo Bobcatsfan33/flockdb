@@ -1,0 +1,27 @@
+[package]
+name = "flock-vfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace root: this is a nightly, libFuzzer-instrumented crate and must never be pulled
+# into the repo's stable `cargo build`/`clippy --workspace`. The root Cargo.toml also lists it under
+# `exclude`, belt and braces.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+flock-vfs = { path = ".." }
+# Only to construct the crate-local error the mock returns for a missing page.
+# (No substrate types are constructed here.)
+
+[[bin]]
+name = "serve_read"
+path = "fuzz_targets/serve_read.rs"
+test = false
+doc = false
+bench = false

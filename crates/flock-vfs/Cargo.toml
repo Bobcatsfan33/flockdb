@@ -1,0 +1,44 @@
+[package]
+name = "flock-vfs"
+description = "The page-faulting read path: DuckDB's file reads served page-by-page from substrate, behind a fuzzed FFI boundary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "duckdb", "vfs", "paging", "ffi"]
+categories = ["database-implementations"]
+
+# A cdylib so the C++ DuckDB FileSystem extension (F4 step 2) can link its `flock_vfs_*` symbols,
+# and an rlib so this crate's own tests — and the fuzz target — can call the Rust boundary directly.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# flock-vfs is a pure read path over substrate's tiered page store. Like flock-sync it deliberately
+# does NOT depend on flock-kernel / DuckDB: the load-bearing correctness (a byte range served from
+# the right pages, or an error — never the wrong bytes, never a panic) lives here and is proven by a
+# proptest oracle that runs hundreds of thousands of cases, and that oracle stays fast and
+# deterministic precisely because there is no SQL engine — and no object store — underneath it.
+substrate-pager.workspace = true
+substrate-store.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The fuzz gate. `serve_read` is a new, unverified trust surface (an FFI read boundary that substrate's
+# in-tree differential/crash fuzzing does not cover — F1's standing objection). proptest hammers it
+# with malformed offsets/lengths, short/oversize/missing pages, and page-straddling reads, and checks
+# the result against an obviously-correct in-memory oracle. See tests/proptest_read.rs.
+proptest = "1"
+tempfile.workspace = true
+
+[features]
+default = []
+# CLAUDE.md rule 5 (substrate rule 5) / flockdb parity. The read path DOES ultimately reach object
+# storage on a cache miss — but only through substrate-store's object-storage client, which is the one
+# place the airgap amputation is enforced. This crate adds no network of its own, so the flag is a
+# no-op here; it must EXIST, or `cargo test --workspace --features airgap` fails to resolve for this
+# member and the airgap gate silently stops running for the whole workspace.
+airgap = []

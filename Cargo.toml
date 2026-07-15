@@ -3,9 +3,14 @@ members = [
     "crates/flock-kernel",
     "crates/flock-core",
     "crates/flock-sync",
+    "crates/flock-vfs",
     "crates/flock-cli",
     "bindings/python",
 ]
+# The fuzz target is a nightly, libFuzzer-instrumented crate. It is NOT a workspace member — it must
+# not be pulled into `cargo build`/`clippy --workspace` on stable — and it declares its own
+# `[workspace]` table to detach, exactly like the measurement spikes do.
+exclude = ["crates/flock-vfs/fuzz"]
 resolver = "2"
 
 [workspace.package]
