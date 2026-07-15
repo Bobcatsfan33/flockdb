@@ -33,6 +33,35 @@ built and clocked (against a zero-network floor, not real object storage).**
 > **Still not measured against real object storage, and still forbidden to quote: any 250 ms number.**
 > F5 quotes none.
 
+> **F4 update (2026-07): the read path is now productionized and its FFI boundary is fuzzed; the C++
+> extension is verified to compile against the real DuckDB API; the S3 number is still unmeasured — now
+> blocked by disk, not network.** Three things changed.
+> **(1) The read path is a real crate, and its trust surface is bought back.** The F5 spike's read logic
+> is lifted into `crates/flock-vfs/` — `serve_read((total_len, offset, buf)) → bytes via a PageSource`,
+> pure and safe-slice-only, with the substrate-backed `TieredPageSource` and the C ABI the extension
+> links. It is **fuzzed hard**, because it is the new FFI trust surface F1 objected to: a proptest oracle
+> ran **300,000** adversarial cases (malformed/huge/overflowing offsets, past-EOF, zero-length,
+> page-straddling reads, short/oversize/missing pages) and a coverage-guided **libFuzzer** target ran
+> **3,028,283** iterations — **zero panics, zero wrong-byte results, zero findings** — plus a real
+> substrate seed→sleep→wake→read round-trip that matches byte-for-byte. The boundary never panics, never
+> reads out of bounds, and refuses a corrupt store rather than serve the wrong page.
+> **(2) The C++ FileSystem extension is real, not sketched.** `extension/flock-vfs/` is the
+> `FlockFileSystem : FileSystem` subclass + the `RegisterSubSystem` entry point, and **both translation
+> units compile cleanly against the actual DuckDB 1.10504 C++ headers** (extracted from the
+> `libduckdb-sys` bundle). Every override signature matches. It was **not** built or loaded as a signed
+> extension in-sandbox (needs `extension-ci-tools`, per-platform signing, and a full DuckDB link — not
+> available here), so wake was **not** re-measured through it; the F5 in-process interpose floor stands
+> as the faithful proxy (same locality, no kernel hop), and this now adds compile-verification that the
+> C++ matches the real API.
+> **(3) The object-storage number is STILL unmeasured — and the reason moved from network to disk.**
+> Unlike F1 (where the network was wholly blocked), a real **MinIO S3 endpoint was stood up here**
+> (`/minio/health/live` → 200). But the measurement could not complete on this near-full shared machine:
+> flock-core's DuckDB-linked test binary could not be linked within the disk headroom, and MinIO itself
+> returned **HTTP 507 Insufficient Storage** on writes because its backing store shares the same
+> near-full volume. A DuckDB-free read-path measurement (`crates/flock-vfs/tests/s3_measure.rs`) is now
+> committed for anyone with a bucket and adequate disk. **Still forbidden, still absent: any 250 ms
+> number.**
+
 ---
 
 ## The claim this risk is about
@@ -56,10 +85,18 @@ network is.
 
 ## What is actually measured
 
-**Wake against a real S3 endpoint: NOT MEASURED.** No S3 endpoint was reachable during F1 (Docker would
-not start headlessly; downloading MinIO was denied by the sandbox). An `#[ignore]`d test,
-`wake_latency_against_a_real_s3_endpoint`, yields the number in one command for anyone with a bucket.
-That is a mechanism, not a promise, and it is not a number.
+**Wake against a real S3 endpoint: NOT MEASURED.** The blocker has moved, and it is worth being precise
+about, because "not measured" must not rot into "can't be measured". During F1 no S3 endpoint was
+reachable at all (Docker would not start headlessly; downloading MinIO was denied). During **F4, a real
+MinIO S3 endpoint *was* stood up** — downloaded, started, `/minio/health/live` returned 200 — so the
+network is no longer the wall. What blocked the number instead was **disk**, on a near-full shared host:
+(a) flock-core's DuckDB-linked test binary (`wake_latency_against_a_real_s3_endpoint`) could not be
+*linked* within the available headroom, and (b) MinIO returned **HTTP 507 Insufficient Storage** on
+writes because its backing store shared the same near-full volume. Two `#[ignore]`d tests yield the
+number in one command for anyone with a bucket and adequate disk: the wake→first-*query* one in
+`flock-core` (`crates/flock-core/tests/tiering.rs`), and a DuckDB-free wake→first-*page-read* one for the
+read path (`crates/flock-vfs/tests/s3_measure.rs`). Those are mechanisms, not promises, and neither is a
+number yet.
 
 **What we could measure is the floor** — against a **zero-latency, in-process** object store, i.e. with
 the network at exactly zero:
