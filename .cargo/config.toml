@@ -1,0 +1,15 @@
+# Why this file exists: the Python extension module (bindings/python -> `flockdb`) is a pyo3 `cdylib`.
+# pyo3's `extension-module` feature deliberately does NOT link against libpython — the `_Py*` symbols
+# are resolved at *import time* by whichever interpreter loads the module. On Linux the linker allows
+# those undefined symbols in a shared object by default; on macOS it does not, so a plain
+# `cargo build --workspace` fails to link the cdylib with "Undefined symbols: _PyBaseObject_Type, ...".
+#
+# `-undefined dynamic_lookup` tells the macOS linker to defer them, which is exactly what maturin passes
+# when it builds the wheel. This makes `cargo build/test/clippy --workspace` behave on macOS the way it
+# already does on the Linux CI runners. It affects only Apple targets and only the link step; a normal
+# binary has no undefined symbols, so it is a no-op for the engine and the CLI.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

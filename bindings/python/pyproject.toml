@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "flockdb"
+description = "A DuckDB you can fork in a millisecond and snapshot for free."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database :: Database Engines/Servers",
+    "License :: OSI Approved :: Apache Software License",
+]
+# Deliberately empty. `import flockdb` must work on a machine with neither pyarrow nor pandas —
+# `Rows` prints itself, sizes itself and names its columns with no help. `.to_arrow()` and `.df()`
+# import them at the moment they are called, and say how to install them if they are not there.
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+pandas = ["pyarrow>=14", "pandas>=2"]
+
+[project.urls]
+Repository = "https://github.com/Bobcatsfan33/flockdb"
+
+[tool.maturin]
+module-name = "flockdb"
+manifest-path = "Cargo.toml"
+# abi3: one wheel per (os, arch), not one per (python, os, arch).
+features = ["pyo3/extension-module"]

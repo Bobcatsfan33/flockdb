@@ -17,8 +17,11 @@ FlockDB is an embedded analytical database: **DuckDB's SQL, on a content-address
 fork costs nothing. The target workload is *many small databases* — a database per tenant, per
 backtest, per service, per agent session — rather than one big one.
 
-This repository is **F1**: the engine. The `flock` CLI (F2), replication (F3), and the fleet plane
-that manages ten thousand of these (F4–F5) are later.
+This repository is **F1** (the engine) and **F2** (the `flock` CLI, and `import flockdb` for Python).
+Replication (F3) and the fleet plane that manages ten thousand of these (F4–F5) are later.
+
+**Fork a database in five commands** — the [Quick start](#quick-start) below is extracted from this
+README and run verbatim in CI, so it cannot drift from what the CLI actually does.
 
 ---
 
@@ -182,6 +185,59 @@ whole file before it will answer anything.** We would rather say that now than d
 ---
 
 ## Quick start
+
+Clone the repo and build the CLI once. This compiles DuckDB from source, so it takes a few minutes —
+that cost is real and we are not going to hide it behind the number below.
+
+```console
+$ git clone https://github.com/Bobcatsfan33/flockdb && cd flockdb
+$ cargo install --path crates/flock-cli    # builds `flock` (compiles DuckDB — minutes, once)
+```
+
+Then, from the repo root, these five commands import a table, **fork it without copying a byte**,
+change the fork, and show the original is untouched. Every line of output below is what you will
+actually see — this block is parsed out of the README and asserted byte-for-byte in CI, so if the CLI
+ever prints something different, the build goes red until this document is fixed.
+
+<!-- QUICKSTART:BEGIN -->
+```console
+$ flock import examples/trades.csv
+imported 10 rows into table "trades" on branch "main"
+
+$ flock sql "SELECT venue, count(*) AS fills, sum(qty) AS shares FROM trades GROUP BY venue ORDER BY shares DESC"
++-------+-------+--------+
+| venue | fills | shares |
++-------+-------+--------+
+| XNAS  | 6     | 590    |
+| ARCX  | 2     | 260    |
+| BATS  | 2     | 180    |
++-------+-------+--------+
+
+$ flock branch what-if
+forked "main" → "what-if" (no pages copied)
+switched to branch "what-if"
+
+$ flock sql "DELETE FROM trades WHERE venue = 'XNAS'"
++-------+
+| Count |
++-------+
+| 6     |
++-------+
+
+$ flock --branch main sql "SELECT count(*) AS still_here FROM trades"
++------------+
+| still_here |
++------------+
+| 10         |
++------------+
+```
+<!-- QUICKSTART:END -->
+
+The fork deleted six rows and `main` still has all ten — two separate databases, and the fork cost no
+copied pages. The build takes minutes; **the five commands, once `flock` is on your path, take well
+under ninety seconds** (`scripts/quickstart.sh` runs them and fails if they do not).
+
+## Using FlockDB as a library
 
 ```rust
 use flock_core::Flock;

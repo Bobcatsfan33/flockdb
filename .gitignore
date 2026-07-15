@@ -16,3 +16,14 @@
 # files live in a TempDir and delete themselves; these are for the ones a human made by hand.
 *.duckdb
 *.duckdb.wal
+
+# Python binding build artifacts (built by maturin into a venv or ./dist, never committed)
+__pycache__/
+*.py[cod]
+/dist/
+/bindings/python/dist/
+*.so
+.pytest_cache/
+.venv/
+# `flock import` creates a pool in the working directory
+.flock/

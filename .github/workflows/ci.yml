@@ -54,6 +54,52 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
+  # The F2 exit criterion, enforced: a stranger forks a database within ninety seconds of the README.
+  #
+  # `scripts/quickstart.sh` does not paraphrase the quickstart — it PARSES the command block out of
+  # README.md and asserts the CLI's output is byte-for-byte what the README claims, then fails if the
+  # five commands exceed the budget. So the README and the CLI cannot disagree while this is green,
+  # and "under ninety seconds" is a measurement rather than a wish. It builds a *release* binary,
+  # because that is what `cargo install` produces and therefore what the reader will actually run.
+  quickstart:
+    name: README quickstart (verbatim)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p flock-cli
+      - run: FLOCK_BIN="$PWD/target/release/flock" bash scripts/quickstart.sh
+
+  # The Python binding is a deliverable, so it is tested as one. `cargo test` proves the cdylib links;
+  # it does NOT prove `import flockdb` works or that fork isolation survives the FFI boundary. This
+  # builds the wheel with maturin (the real distribution path — there is no PyPI package, by design)
+  # and runs the smoke suite, which forks a database and checks the parent does not move.
+  python:
+    name: python binding (maturin + pytest)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      # Build the wheel and install it, rather than `maturin develop`, which needs an active
+      # virtualenv that setup-python does not provide. This is also closer to what a user does.
+      - run: pip install maturin pytest
+      - run: maturin build --release --manifest-path bindings/python/Cargo.toml --out dist
+      - run: pip install --find-links dist flockdb
+      - run: pytest bindings/python/tests -q
+
   # CLAUDE.md rule 5 in substrate: everything must compile and pass with networking amputated at
   # compile time. Nothing in FlockDB reaches the network — this job is what keeps that true rather
   # than merely currently-true.

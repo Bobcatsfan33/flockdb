@@ -1,0 +1,35 @@
+[package]
+name = "flock-cli"
+description = "The `flock` command line: import a file, query it, fork it, put it to sleep."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "cli", "fork", "duckdb", "olap"]
+categories = ["command-line-utilities", "database-implementations"]
+
+# The binary is `flock`, not `flock-cli`. The crate has to be called something unique on crates.io;
+# the thing a person types does not.
+[[bin]]
+name = "flock"
+path = "src/main.rs"
+
+[dependencies]
+flock-core = { path = "../flock-core", version = "0.1.0" }
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+object_store.workspace = true
+# Not a dev-dependency: `flock wake` fetches the database into a throwaway cache directory before
+# adopting its pages into the pool. See `cmd::tier`.
+tempfile.workspace = true
+
+[features]
+default = []
+# CLAUDE.md rule 5. `cargo test --workspace --features airgap` selects every member, and a member
+# without the feature makes the whole invocation fail to resolve — so the gate would stop running
+# and nobody would notice. It must exist here even though the CLI adds no network of its own.
+airgap = ["flock-core/airgap"]

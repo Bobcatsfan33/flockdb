@@ -83,7 +83,10 @@ pub use substrate_pager::ManifestId;
 // registry stores — a pool, a manifest id, and a page size, and nothing else — and wrapping it in a
 // FlockDB newtype would buy nothing and cost the caller the ability to hand it to any other tool
 // built on the same engine. `RemoteTier` is likewise just "a bucket, and which pool it holds".
-pub use substrate_store::{RemoteTier, WakeToken};
+//
+// `StoreError` comes with them, because `WakeToken::to_json` returns one: a caller that can build a
+// token but cannot name the error that building it produces is a caller that has to `unwrap()`.
+pub use substrate_store::{RemoteTier, StoreError, WakeToken};
 
 /// The object-storage backends `RemoteTier` accepts (S3, GCS, Azure, in-memory, local filesystem).
 ///

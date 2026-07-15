@@ -1,0 +1,35 @@
+[package]
+name = "flock-py"
+description = "Python bindings for FlockDB: a DuckDB you can fork in a millisecond."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# The module Python imports is `flockdb`, and it is native all the way down — there is no
+# pure-Python shim package. `to_arrow()` and `df()` import pyarrow and pandas *at the moment they
+# are called*, from Rust, so `import flockdb` still works on a machine that has neither.
+name = "flockdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+flock-core = { path = "../../crates/flock-core", version = "0.1.0" }
+pyo3.workspace = true
+
+# Arrow, for one thing only: the IPC writer. DuckDB pulls `arrow` in already, but *without* its `ipc`
+# feature (there is no `arrow-ipc` in Cargo.lock), and `Rows.to_arrow()` needs a wire format to hand
+# pyarrow. Cargo unifies features on the single `arrow` 58.x in the graph, so this enables IPC on the
+# same crate DuckDB is using — one arrow, one set of types, no version skew at the seam.
+#
+# The alternative was arrow's own `pyarrow` feature, which pins its OWN pyo3. Two pyo3s in one
+# extension module is a link error at best.
+arrow = { version = "58.3", features = ["ipc"] }
+
+[features]
+default = []
+# CLAUDE.md rule 5, again: `cargo test --workspace --features airgap` selects every workspace member,
+# and a member without the feature makes the invocation fail to resolve.
+airgap = ["flock-core/airgap"]
