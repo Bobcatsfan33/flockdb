@@ -1,6 +1,7 @@
 # RISK-1 — wake is O(database), and it gates the 250 ms claim
 
-**Status: OPEN, but the direction is now settled and the upside is measured.**
+**Status: OPEN, but the direction is settled, the upside is measured, and the read path is now
+built and clocked (against a zero-network floor, not real object storage).**
 **Owner: F4 (wake-on-query scheduler).**
 **Blocks: any public "wake one in 250 ms" claim, and any demo of one.**
 
@@ -15,6 +16,22 @@
 > eager hydration, and a page-faulting read path would in fact deliver a lazy wake
 > for the wake-one-of-many case. The full-table-scan caveat below is also confirmed.
 > **Still not measured, and still forbidden to quote: any 250 ms number.**
+
+> **F5 update (2026-07): the fault set is now a wall-clock latency, and it is flat.** F4 measured how
+> many pages wake faults; F5 built a **real page-faulting read path** and clocked wake→first-row on
+> stock DuckDB across databases from 1.5 MB to 59 MB (`spikes/wake-latency/`). **(1) Wake-one-of-many
+> is flat in time, not just in bytes.** A point lookup wakes its database and returns a row in
+> **~40–105 ms regardless of database size**, faulting a flat ~14 pages; today's eager-hydration wake
+> is **O(database)** on the same rig — 0.12 s at 1.5 MB, **11.6 s at 59 MB** — and the full-scan
+> control scales too, exactly as the caveat requires. **(2) The read path was built without FUSE.**
+> macFUSE (a privileged kernel extension) was not installable, so the path was built at the *same
+> file-read boundary a FUSE handler sits at* but in-process, via the dyld `__interpose` mechanism —
+> which makes the floor a *lower bound* on FUSE's (FUSE adds a kernel hop per fault) and a faithful
+> proxy for an in-process **C++ FileSystem extension**, the recommended production mechanism (see
+> "Which read path to build", below). **(3) The floor is a floor.** ~100 ms for the point case **with
+> the network at zero** — it already eats ~40 % of a 250 ms budget before a single S3 round-trip.
+> **Still not measured against real object storage, and still forbidden to quote: any 250 ms number.**
+> F5 quotes none.
 
 ---
 
@@ -94,6 +111,57 @@ pages), not the *fault latency* (object-storage round-trips per 256 KiB block, a
 page fault mid-query blocks on object storage — a latency-distribution problem, and p99 is what a user
 feels. **No 250 ms number until a real read path is built and clocked against real object storage.**
 
+## What F5 measured: the fault set, now a wall-clock latency, and it is flat
+
+F4 stopped at "how many pages". F5 built a **real page-faulting read path** — stock DuckDB opens a
+database file, and every `pread` it issues on that file is served, page by page, from substrate's
+`TieredStore` on demand — and clocked **wake→first-row** across databases from 1.5 MB to 59 MB
+(`spikes/wake-latency/`). The tier is substrate's `LocalFileSystem` object store: a real
+`object_store` code path with the **network at exactly zero**, so every number is a **floor**.
+
+macFUSE was not installable in the spike environment (a privileged kernel extension), so the read
+path was built at the *same file-read boundary a FUSE handler would sit at* but **in-process**, via
+the dyld `__interpose` mechanism — the same interception point the F4 trace used, turned from a
+tracer into a server. That makes this floor a **lower bound on FUSE's** (FUSE adds a kernel round-trip
+per fault) and a faithful **proxy for an in-process C++ FileSystem extension** (same locality).
+
+Every lazy/eager result was checked byte-for-byte against the ground truth, so these are
+correctness-verified, not merely fast.
+
+**Wake→first-row latency (ms, zero network, min of cold runs):**
+
+| database | `point`/lazy | `hot`/lazy | `open`/lazy | `cold`/lazy (full scan) | eager = today's hydrate |
+|---:|---:|---:|---:|---:|---:|
+| 1.5 MB | 58 | 45 | 39 | 59 | 116 |
+| 8 MB | 96 | 37 | 31 | 248 | 631 |
+| 30 MB | 97 | 43 | 35 | 1,079 | 2,588 |
+| 59 MB | **105** | **51** | **55** | **3,792** | **11,644** |
+| shape | **FLAT** | **FLAT** | **FLAT** | **scales** | **scales O(database)** |
+
+And the fault counts behind them — deterministic, identical across every run, the direct wall-clock
+confirmation of F4's fault-set table:
+
+| database | `open` | `hot` | `point` | `cold` | eager |
+|---:|---:|---:|---:|---:|---:|
+| 1.5 MB | 3 | 5 | 8 | 8 | 17 |
+| 59 MB | 4 | 5 | **14** | **335** | **942** |
+| KiB | ~256, flat | 320, flat | **896, flat** | scales | scales |
+
+Read it against the floor table in "What is actually measured":
+
+- **Wake-one-of-many is flat in wall-clock time, not just in bytes.** A point or small-table query
+  wakes its database and returns a row in **~40–105 ms whether the database is 1.5 MB or 59 MB**,
+  because it faults a flat ~4–14 pages. That is the claim RISK-1 exists to test, and it holds.
+- **Today's wake is O(database), and the spike reproduces it as the control:** eager hydration goes
+  0.12 s → **11.6 s** across the same 1.5 → 59 MB, and keeps climbing. The flat curve means nothing
+  without this rising one beside it (the AT-011 lesson: a single number in isolation proves nothing).
+- **The full-scan caveat survives as a measured fact.** `cold`/lazy is *not* flat — 59 ms → 3.8 s.
+  Being lazy does not make a full scan cheap, and no read path can. The honest contrast is the result.
+- **The floor is a floor.** ~100 ms for the point case is with the network at zero, dominated by
+  per-fault synchronous overhead (~7 ms/fault: `block_on` + a tier get + a BLAKE3 verify), not by page
+  count. Real object storage adds first-byte latency **per fault** on top. It **already eats ~40 % of
+  a 250 ms budget before a single S3 round-trip.** This is precisely why no 250 ms number is quoted.
+
 ## The mechanism: verified, and the stock in-process path is closed
 
 F1 claimed the C API cannot register a filesystem. F4 re-verified it against the actual DuckDB 1.10504
@@ -112,22 +180,32 @@ sources, because the claim gates a real build decision:
 - **`duckdb-rs` binds only the C API.** One grep hit for "filesystem" in its `src/`, a test comment.
 
 So the in-process, stock-API fix is genuinely **impossible today**, and this is the reason FlockDB uses
-the temp-file fallback. The remaining routes, cheapest first:
+the temp-file fallback. The remaining routes:
 
 1. **FUSE mount.** Mount a userspace filesystem backed by substrate; open the database at a path on it.
-   Stock DuckDB, no patching, and its `pread`s become substrate faults — the measured read set says this
-   would be lazy. **Cost:** a FUSE dependency (macFUSE / libfuse), a mount to manage, and a kernel
-   round-trip per fault (latency, and a scheduling boundary), on the hottest path in the product.
-2. **C++ loadable extension** that registers a `FileSystem` subclass calling back into Rust. **Cost:**
-   shipping and signing a C++ extension per platform, and putting the most safety-critical bytes in the
-   system behind an FFI boundary we cannot fuzz with the rest of the engine (F1's objection, still valid).
+   Stock DuckDB, no patching, and its `pread`s become substrate faults. **Cost:** a FUSE dependency
+   (macFUSE / libfuse), a **privileged mount** (macFUSE kext; Linux CAP_SYS_ADMIN / privileged pod), a
+   daemon and mount to supervise, and a **kernel round-trip per fault** on the hottest path.
+2. **C++ loadable extension** that registers a `FileSystem` subclass calling back into Rust. In-process,
+   unprivileged, no kernel hop — the *same* locality the F5 spike measured. **Cost:** shipping and
+   **signing a C++ extension per platform**, and putting the most safety-critical bytes behind an FFI
+   boundary substrate's in-tree fuzzing does not cover (F1's objection, still valid — it is bought back
+   with a fuzz harness over the FFI read boundary, and that is the real price, not the C++).
 3. **Patched DuckDB.** Heaviest — a fork to maintain against every DuckDB release.
 4. **Wait for the C API to grow the hook.** A future DuckDB C API could add filesystem registration,
    which would reopen the cheap in-process path. Not something to plan around, but worth watching.
 
-None of these is "just write an extension." Each is a real project with a real maintenance bill, and the
-choice between them is a decision for a human, not a default. **What is no longer in doubt is that one of
-them would work** — the fault set is small and flat, so a lazy read path yields a lazy wake.
+### Which read path to build (F5's recommendation)
+
+**Production should target the C++ FileSystem extension (route 2), not FUSE.** Both deliver the same
+lazy wake — F5 clocked the in-process floor either would build on — so the choice is operational, and
+it is not close for FlockDB's shape. FUSE's privileged mount and per-fault kernel round-trip are the
+wrong tax on a dense multi-tenant *"sleep a million databases"* fleet: privileged pods and a
+context-switch pair on every page fault. The extension keeps the in-process locality the floor was
+measured at, in an unprivileged container. **FUSE is a legitimate dev/PoC vehicle** (faster to stand
+up on one node) and a single-tenant fallback — it is not the fleet mechanism. The stock **C API still
+has no filesystem hook** (route 2 must be C++, not a C extension). **What is no longer in doubt is
+that route 2 works and is flat** — F5 built the equivalent read path and clocked it.
 
 ## What this permits, and what it forbids
 
@@ -135,13 +213,18 @@ them would work** — the fault set is small and flat, so a lazy read path yield
 buried here. Sleep/wake works, is crash-safe, and is genuinely useful for archival — it is simply not
 fast enough to make a sleeping database feel live.
 
-**Forbidden until the lazy-wake path is *built*, not merely shown to be possible:**
-- Publishing, quoting, or demoing a 250 ms wake number. F4 proved the fault set is small; it did **not**
-  build a read path or clock one against object storage. Possible is not measured.
-- The F4 wake-on-query scheduler, whose entire premise is that a query can wake its own database inline.
-  It still cannot be built on the *current* O(database) wake — that wake would miss its deadline by
-  construction. The scheduler waits on a real page-faulting read path (FUSE or C++ extension), not on
-  this proof. The proof unblocks the *decision to build that path*; it does not replace it.
+**Forbidden until the lazy-wake path is clocked against *real object storage*, not merely built:**
+- Publishing, quoting, or demoing a 250 ms wake number. F5 built a page-faulting read path and clocked
+  it, but **against a zero-network local tier** — a floor, and one that already spends ~100 ms on the
+  point case (~40 % of the budget) before a single S3 round-trip. The number that decides the claim is
+  the same measurement against a real object store, which is still the `#[ignore]`d
+  `wake_latency_against_a_real_s3_endpoint` test, and is still **not measured**.
+- The F4 wake-on-query scheduler, whose premise is that a query can wake its own database inline. F5
+  shows a real read path *is* flat and fast at the floor — so the scheduler is no longer blocked on
+  *whether* a lazy wake exists, only on that read path being **productionized** (route 2 above) and
+  clocked against real object storage. It still cannot be built on the *current* O(database) wake,
+  which the F5 control clocked at 11.6 s for a 59 MB database — it would miss its deadline by
+  construction.
 
 ## How this was found, and then narrowed
 
@@ -154,4 +237,13 @@ spent weeks building it. `proofs/lazy-wake/` traces DuckDB's real read syscalls 
 is flat and small for wake and selective queries — so a page-faulting read path is worth building — and
 confirms it stays O(scan) for a full table scan — so the pitch must stay honest about what "wake" makes
 fast. The mechanism question ("can we even intercept those reads") was re-verified against the shipped
-DuckDB sources rather than trusted from F1. What remains is a human's call on *which* read path to build.
+DuckDB sources rather than trusted from F1.
+
+F5 then built the read path F4 argued for — a real page-faulting server, not a trace — and clocked
+wake→first-row on stock DuckDB (`spikes/wake-latency/`): wake-one-of-many is flat in wall-clock time
+(~40–105 ms, 1.5 → 59 MB), today's eager hydration is O(database) (up to 11.6 s), and a full scan
+still scales. It did this *without* FUSE (uninstallable), at the same file-read boundary FUSE uses but
+in-process — which also settled *which* read path to build: the in-process C++ FileSystem extension,
+not FUSE. Each step measured the next step's premise before paying for it, and each stopped at the
+zero-network floor rather than quote a number it had not earned. **The 250 ms line is still unmeasured
+against real object storage, and still unquoted.** That is the whole discipline this risk enforces.

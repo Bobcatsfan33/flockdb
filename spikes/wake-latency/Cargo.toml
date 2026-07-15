@@ -1,0 +1,23 @@
+# Out-of-workspace measurement spike (like proofs/lazy-wake/, this is NOT a member of the root
+# FlockDB workspace — it is a measurement instrument, not shippable code). The `[workspace]` table
+# makes this its own workspace root so cargo does not try to fold it into the repo's workspace.
+#
+# It has its OWN target/ (deliberately): the shim links substrate + tokio + object_store but NOT
+# DuckDB, so it builds fast and does not recompile the 1.4 GB bundled DuckDB rlib. The DuckDB side
+# lives entirely in the prebuilt libduckdb.a that the C harness links (see run.sh).
+[workspace]
+members = ["seed", "faultshim"]
+resolver = "2"
+
+[workspace.dependencies]
+# Pinned to the SAME substrate tag the FlockDB workspace uses (root Cargo.toml). A page written by
+# the seeder must be byte-identical to a page the shim reads back, and content addressing makes a
+# format mismatch silent — so the tag must match, exactly as CLAUDE.md rule 1 requires of the repo.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+object_store = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[profile.release]
+# The measurement must be an optimized build or the latency is meaningless.
+opt-level = 3

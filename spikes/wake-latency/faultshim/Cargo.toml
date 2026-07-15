@@ -1,0 +1,23 @@
+[package]
+name = "faultshim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A cdylib so its `flock_*` symbols are dlsym-able from the C interpose glue and the C harness.
+# DYLD_INSERT_LIBRARIES loads it into the DuckDB process; DuckDB's `pread`s on the sparse database
+# file are served, page by page, straight out of substrate's TieredStore — a real page-faulting
+# read path, not a trace.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+substrate-pager.workspace = true
+substrate-store.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+# Compiles the C interpose glue (the __DATA,__interpose plumbing) into this same dylib so the
+# whole page-faulting read path is one loadable image.
+cc = "1"

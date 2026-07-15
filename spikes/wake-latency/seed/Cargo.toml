@@ -1,0 +1,16 @@
+[package]
+name = "seed"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Substrate-only: no DuckDB in the Rust seeder. The plain .duckdb file is produced by the C
+# `duckharness seed` (which links the already-built libduckdb.a); this tool only chunks that file
+# into substrate pages — exactly as flock-kernel/src/paging.rs::persist does — and sleeps the store
+# to the local object-store tier. Keeping DuckDB out of the Rust side is what lets the spike build
+# in seconds instead of recompiling the bundled DuckDB rlib.
+[dependencies]
+substrate-pager.workspace = true
+substrate-store.workspace = true
+object_store.workspace = true
+tokio.workspace = true
