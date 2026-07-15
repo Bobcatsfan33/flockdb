@@ -33,6 +33,10 @@ thiserror.workspace = true
 # the result against an obviously-correct in-memory oracle. See tests/proptest_read.rs.
 proptest = "1"
 tempfile.workspace = true
+# `aws` for the `#[ignore]`d real-object-storage read-path measurement (tests/s3_measure.rs): the same
+# S3 client flock-core's tiering test uses, so the read path can be clocked against a real bucket. No
+# DuckDB is involved — this measures wake→first-page-fault, the object-storage round-trip itself.
+object_store = { workspace = true, features = ["aws"] }
 
 [features]
 default = []
