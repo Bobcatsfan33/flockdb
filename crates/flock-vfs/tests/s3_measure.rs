@@ -26,7 +26,7 @@
 //! on each of those faults. No 250 ms claim is made from it — it is one honest measurement of the piece
 //! that was previously unmeasured.
 
-use flock_vfs::{serve_read, TieredPageSource};
+use flock_vfs::{serve_read, PageSource, TieredPageSource};
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use std::time::Instant;
@@ -143,6 +143,120 @@ fn wake_read_path_against_a_real_s3_endpoint() {
     );
     println!("tier faults (S3 GETs)           : {}", stats.misses);
     println!("(measures wake -> first page read, NOT wake -> first query. No 250 ms claim.)");
+}
+
+/// The measurement that gates any latency claim and calibrates the prefetch fan-out: fault the SAME
+/// warm set two ways against the SAME real bucket — **serially** (the reactive path: one fault, wait,
+/// the next, as DuckDB drives it) and **coalesced** (`PageSource::prefetch`, which fans the faults out
+/// concurrently) — and report both wall-clocks.
+///
+/// Why this is the number that matters: `docs/wake-latency.md` proved the fault SET is flat (~21 pages
+/// regardless of database size) and that on a local/same-runner tier its faults are ~free. This puts a
+/// REAL wide-area round-trip on each of those faults. Serially, a 21-page set costs ~21 × RTT — that is
+/// where a sub-second wake dies. Coalesced, the same set costs ~1 × RTT plus fan-out overhead. The ratio
+/// this prints is exactly how much the flockd wake scheduler's coalescing buys, and the per-fault RTT it
+/// derives is what tells us whether the fan-out (currently 16) should grow.
+///
+/// **Scope, stated so no one over-reads it (CLAUDE.md rule 6):** the number is only a *wide-area* number
+/// if `MINIO_URL` points at a bucket a real network away from this process. Against same-runner MinIO
+/// (the `wake-latency.yml` control) the RTT is ~0 and serial≈coalesced — which is itself the honest
+/// finding that the same-runner endpoint is NOT wide-area. **No 250 ms claim is made from this test**,
+/// and none may be quoted until it is run against a genuinely remote bucket. It measures fault fetch, not
+/// wake→first-*query* (no SQL engine here); it is the load-bearing input to that number, not the number.
+#[test]
+#[ignore = "needs an S3-compatible endpoint; set MINIO_URL. Measures serial vs coalesced fault fetch — the wide-area gate on any latency claim."]
+fn serial_vs_coalesced_fault_fetch_against_a_real_s3_endpoint() {
+    let page_size = 4096usize;
+    // A warm set of ~21 pages — the wake-one-of-many fault set size. Seed enough distinct pages that
+    // faulting them serially vs concurrently is a real difference against a real RTT.
+    let warm_pages: u64 = 21;
+    let n_pages: u64 = 40; // a little larger than the warm set, so the set is a subset, not the whole file
+    let data: Vec<u8> = (0..(n_pages * page_size as u64))
+        .map(|i| (i.wrapping_mul(7).wrapping_add(3)) as u8)
+        .collect();
+    let total_len = data.len() as u64;
+    // Spread the warm set across the file so the faults are distinct objects, not one contiguous run.
+    let warm_set: Vec<u64> = (0..warm_pages).map(|i| i * n_pages / warm_pages).collect();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let seed_cache = tmp.path().join("seed-cache");
+    std::fs::create_dir_all(&seed_cache).unwrap();
+
+    let remote = s3_backend();
+    let pool = remote.pool().to_string();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (token, seeded_len) =
+        rt.block_on(seed_and_sleep(remote, &seed_cache, &pool, page_size, &data));
+    assert_eq!(seeded_len, total_len);
+
+    // --- Wake A (cold): fault the warm set SERIALLY, exactly as a reactive read path would.
+    let cache_a = tmp.path().join("wake-serial");
+    std::fs::create_dir_all(&cache_a).unwrap();
+    let store_a = rt
+        .block_on(TieredStore::wake(
+            &cache_a,
+            s3_backend_same_pool(&pool),
+            &token,
+        ))
+        .unwrap();
+    let source_a = TieredPageSource::new(Arc::new(store_a), total_len);
+    let t_serial = Instant::now();
+    for &p in &warm_set {
+        // One fault, then the next — the serial pattern. (Default prefetch is exactly this loop, but
+        // spelled out here so the comparison is unmistakable.)
+        source_a.read_page(p).unwrap();
+    }
+    let serial_ms = t_serial.elapsed().as_secs_f64() * 1000.0;
+    let serial_faults = source_a.store().stats().misses;
+
+    // --- Wake B (cold, fresh cache): fault the SAME set COALESCED, via prefetch.
+    let cache_b = tmp.path().join("wake-coalesced");
+    std::fs::create_dir_all(&cache_b).unwrap();
+    let store_b = rt
+        .block_on(TieredStore::wake(
+            &cache_b,
+            s3_backend_same_pool(&pool),
+            &token,
+        ))
+        .unwrap();
+    let source_b = TieredPageSource::new(Arc::new(store_b), total_len);
+    let t_coalesced = Instant::now();
+    source_b.prefetch(&warm_set);
+    let coalesced_ms = t_coalesced.elapsed().as_secs_f64() * 1000.0;
+    let coalesced_faults = source_b.store().stats().misses;
+
+    let per_fault_rtt = serial_ms / warm_pages as f64;
+    let speedup = if coalesced_ms > 0.0 {
+        serial_ms / coalesced_ms
+    } else {
+        f64::INFINITY
+    };
+    println!("--- serial vs coalesced fault fetch of a {warm_pages}-page warm set (REAL object storage) ---");
+    println!(
+        "serial   (reactive, one fault at a time) : {serial_ms:.1} ms  ({serial_faults} GETs)"
+    );
+    println!("coalesced (prefetch, concurrent)         : {coalesced_ms:.1} ms  ({coalesced_faults} GETs)");
+    println!("derived per-fault RTT (serial / pages)   : {per_fault_rtt:.1} ms");
+    println!("coalescing speedup                       : {speedup:.1}x");
+    println!("(If speedup ≈ 1x, MINIO_URL is a low-latency/same-runner endpoint — NOT wide-area. No 250 ms claim.)");
+
+    // Correctness, not just timing: coalesced must fault the same set. (Both wakes are cold, so both
+    // pay the same GETs; only their overlap in time differs.)
+    assert_eq!(
+        serial_faults, coalesced_faults,
+        "serial and coalesced faulted different numbers of pages — not a like-for-like comparison"
+    );
+    assert!(
+        coalesced_faults >= warm_pages,
+        "coalesced fault should have faulted the whole warm set from the cold tier"
+    );
+
+    drop(rt);
 }
 
 fn s3_backend_same_pool(pool: &str) -> RemoteTier {
