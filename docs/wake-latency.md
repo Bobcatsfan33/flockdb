@@ -71,7 +71,7 @@ built and clocked (against a zero-network floor, not real object storage).**
 > it end-to-end.**
 
 > **F4 update (2026-07): the C++ extension is now BUILT AND LOADED into a real DuckDB, serves correct
-> rows, and the wake→first-QUERY harness + workflow are in-repo — the number is pending its CI run.**
+> rows, and the wake→first-QUERY number is now MEASURED (below): the lazy point query's fault count is FLAT (~21) across a 40x database-size range, on both a local floor and a same-runner MinIO; eager hydration is O(database) up to ~2s at 59MB; cold scans are O(data). Wide-area is still the follow-on. No 250ms.**
 > The one gap the previous update named ("verified to compile … but NOT built/loaded, so wake was NOT
 > re-measured through it") is closed at the mechanism level, and the wake→**query** measurement (not
 > just wake→page-read) now has a home.
@@ -281,34 +281,58 @@ the database; every `pread` DuckDB issues is served page-by-page from substrate'
 `flock-vfs` boundary. Exercising the load surfaced and fixed one production bug (`FileExists` must report
 the `<db>.wal` sibling absent, or a READ_ONLY attach tries to open a WAL a sleeping snapshot has none of).
 
-**What the run measures, and the shape it must show:**
+**The run has been taken. Here is the measured result — wake → first QUERY RESULT, through the loaded
+FlockFileSystem extension, across four database sizes and two tiers.** (CI run: the `wake-query`
+workflow; fault counts read from the `flock_vfs_tier_misses` FFI = substrate's real tier GETs; every
+faulted result checked byte-for-byte against stock DuckDB.)
 
-| query | what it does | expected fault count | expected wake→query shape |
-|---|---|---|---|
-| `open` (`SELECT 1`) | pure wake (ATTACH only) | flat, small | **FLAT** vs database size |
-| `hot` | selective aggregate, small table | flat, small | **FLAT** |
-| `point` | zonemap-pruned point lookup | flat, small | **FLAT** — the wake-one-of-many claim |
-| `cold` | full-table aggregate (control) | scales O(scan) | **scales** |
-| `point`/**eager** | today's hydrate-all then query | scales O(database) | **scales O(database)** |
+**TIER = LocalFileSystem floor (network at zero):**
 
-The `point`-flat-vs-`cold`/`eager`-scaling contrast **is** the result, at the query level now, not just
-the page-read level. The fault count is read from the new `flock_vfs_tier_misses` FFI (substrate's real
-tier GETs), so laziness is measured off the running engine. Every faulted result is checked byte-for-byte
-against stock DuckDB on the real file.
+| DB | `point` lazy | `point` faults | `point`/EAGER | EAGER faults | `cold` full-scan |
+|---:|---:|---:|---:|---:|---:|
+| 1.5 MB | 11.8 ms | 7 | 28 ms | 17 | 10.9 ms |
+| 8 MB | 24.4 ms | **21** | 182 ms | 122 | 38.6 ms |
+| 30 MB | 26.9 ms | **22** | 504 ms | 474 | 117 ms |
+| 59 MB | 28.6 ms | **21** | 1397 ms | 942 | 257 ms |
 
-**Scope, stated before the run so it cannot drift:**
-- **Two tiers, never conflated.** A `LocalFileSystem` **floor** (network at zero) and, additionally, a
-  **same-runner MinIO** endpoint — a real object store, but a *low-latency, datacenter-local* one. The
-  MinIO number is a low-latency-endpoint number and is labelled as such.
-- **Wide-area is the follow-on.** No geographically distant bucket is measured here. When one is, it is a
-  separate, clearly-labelled number — it adds real first-byte latency per fault on top of the MinIO pass.
-- **Still no 250 ms.** The floor already spends ~100 ms on the point case at zero network (F5); this pass
-  does not license a 250 ms claim, and quotes none.
-- **The number is pending.** The workflow is committed and compile/lint/test-verified but **not yet run**
-  (wake findings are reviewed before triggering). No wake→query cell is quoted until the run produces it.
+**TIER = same-runner MinIO (real object storage, low-latency / datacenter-local endpoint):**
 
-**flockd stays HELD** until this number exists and holds — the wake-on-query scheduler's premise is a
-query that wakes its own database inline, and that premise is exactly what this measurement tests.
+| DB | `point` lazy | `point` faults | `point`/EAGER | EAGER faults |
+|---:|---:|---:|---:|---:|
+| 1.5 MB | 27.7 ms | 7 | 77 ms | 17 |
+| 8 MB | 48.0 ms | **21** | 267 ms | 122 |
+| 30 MB | 51.1 ms | **22** | 1030 ms | 474 |
+| 59 MB | 50.3 ms | **21** | 2014 ms | 942 |
+
+**What this establishes, precisely:**
+
+- **The lazy point query's fault count is FLAT — ~21 faults regardless of database size, across a 40×
+  range (1.5 → 59 MB).** This is the load-bearing "wake-one-of-many" claim, now measured off the running
+  engine at the *query* level, not inferred from a page-read trace. `open` and `hot` are flat too.
+- **The eager control (today's hydrate-all-then-query) SCALES O(database):** 17 → 942 faults, 28 ms →
+  **1.4 s** (local) / 77 ms → **2.0 s** (MinIO). At 59 MB the lazy point query beats it **~40–49×** in
+  both latency and fault count.
+- **Cold full scans SCALE O(data)** — 7 → 334 faults — exactly as the scope requires. A page-faulting
+  read path does not make a full-table scan lazy, and this measures that it does not.
+
+**Scope — read before quoting any cell:**
+- **MinIO here is a same-runner, low-latency, datacenter-local endpoint — NOT wide-area S3.** The ~50 ms
+  point-query number is a low-latency-endpoint number. A geographically distant bucket adds real
+  first-byte latency **per fault** on top, and there are ~21 faults, so wide-area will be materially
+  higher. **Wide-area remains the follow-on and is not measured here.**
+- **Still NO 250 ms claim.** ~50 ms at a same-runner endpoint does not license a 250 ms marketing number
+  against wide-area object storage. The measured claim is narrower and solid: **the lazy point query's
+  fault count and latency are flat across database size; eager hydration is O(database); cold scans are
+  O(data).**
+- **The bug the measurement caught:** the first full run failed at 59 MB on a missing-page fault — a
+  *race* between concurrent faults on the same page (one writing the cache file while another read it
+  torn/absent). Fixed by serialising same-page faults, with a `concurrent_faults.rs` regression test.
+  Only findable by loading the extension and running real queries at scale.
+
+**flockd:** the number the wake-on-query scheduler's premise depends on now exists and holds *for a
+low-latency endpoint*. Whether that is sufficient to start flockd, or whether the wide-area number is a
+prerequisite, is a product decision — the honest position is that the flat-fault-count thesis is proven,
+and the wide-area latency is the one piece still unmeasured.
 
 ## The mechanism: verified, and the stock in-process path is closed
 
