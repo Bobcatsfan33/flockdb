@@ -194,9 +194,23 @@ FileType FlockFileSystem::GetFileType(FileHandle &handle) {
 bool FlockFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	(void)opener;
 	// A flock:// path denotes a sleeping database that exists by construction of its WakeToken; the
-	// wake in OpenFile is the real existence check. Report true for well-formed paths so DuckDB opens
-	// them rather than short-circuiting.
-	return CanHandleFile(filename);
+	// wake in OpenFile is the real existence check. Report true for a well-formed database URI so
+	// DuckDB opens it rather than short-circuiting.
+	//
+	// BUT report the SIBLING paths DuckDB probes on open as absent — chiefly `<db>.wal`. A sleeping
+	// database is a single immutable snapshot with no separate write-ahead log; if we claimed its `.wal`
+	// existed, DuckDB (even for a READ_ONLY attach) would try to open and replay a WAL that is not there.
+	// A well-formed database URI carries its wake parameters in a query string and does not end in
+	// ".wal"; anything ending ".wal" is a probe for a log this snapshot does not have.
+	if (!CanHandleFile(filename)) {
+		return false;
+	}
+	const std::string wal_suffix = ".wal";
+	if (filename.size() >= wal_suffix.size() &&
+	    filename.compare(filename.size() - wal_suffix.size(), wal_suffix.size(), wal_suffix) == 0) {
+		return false;
+	}
+	return filename.find('?') != std::string::npos;
 }
 
 void FlockFileSystem::Seek(FileHandle &handle, idx_t location) {

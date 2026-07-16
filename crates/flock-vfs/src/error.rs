@@ -116,6 +116,20 @@ pub enum VfsError {
         detail: String,
     },
 
+    /// The object-storage tier could not be constructed from the paths/environment it was given.
+    ///
+    /// Reachable only from `flock_vfs_open` (via [`crate::backend::remote_tier`]): the local tier
+    /// directory could not be opened, or — under `--features s3` — the S3 endpoint/credentials were
+    /// malformed. It is a configuration fault, not a read fault; there is nothing to read from yet.
+    #[error(
+        "could not construct the object-storage tier: {detail}. This is a wake-time configuration \
+         error, not a corrupt database."
+    )]
+    TierConfig {
+        /// What was wrong with the tier configuration and how to fix it.
+        detail: String,
+    },
+
     /// A value handed across the C ABI was malformed — a null pointer, non-UTF-8 string, or bad hex.
     ///
     /// Reachable only from the FFI boundary, where the caller is C++ we do not control. Every such value

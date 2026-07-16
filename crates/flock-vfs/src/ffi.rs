@@ -17,15 +17,15 @@
 //! flock_vfs_close(h);
 //! ```
 
+use crate::backend::remote_tier;
 use crate::error::{Result, VfsError};
 use crate::read::serve_read;
 use crate::tiered::TieredPageSource;
-use object_store::local::LocalFileSystem;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
 use substrate_pager::ManifestId;
-use substrate_store::{RemoteTier, TieredStore, WakeToken};
+use substrate_store::{TieredStore, WakeToken};
 
 /// An opaque, woken database handle. Created by [`flock_vfs_open`], read by [`flock_vfs_pread`], freed
 /// by [`flock_vfs_close`]. Opaque to C on purpose — its layout is not ABI.
@@ -90,16 +90,12 @@ fn open_inner(
         detail: format!("could not create it: {e}"),
     })?;
 
-    // The object-storage tier. This build wires a LocalFileSystem tier — the same real `object_store`
-    // code path the F5 floor was measured against, and what the S3 test (step 3) swaps for an S3
-    // backend. A production extension parameterizes this by an object-store URL; that is a backend
-    // choice, not a change to the read path below it.
-    let backend =
-        LocalFileSystem::new_with_prefix(remote_dir).map_err(|e| VfsError::BadFfiArgument {
-            what: "remote directory path",
-            detail: format!("could not open it as a local object-store tier: {e}"),
-        })?;
-    let remote = RemoteTier::new(Arc::new(backend), pool.to_string());
+    // The object-storage tier. [`backend::remote_tier`] picks it: a `LocalFileSystem` tier by default
+    // (the zero-network floor the F5 measurement used), or — under `--features s3` with
+    // `FLOCK_VFS_S3_URL` set — an S3-compatible tier, so the same read path can be clocked against real
+    // object storage (RISK-1 step 3). Which one is a backend choice *below* the fuzzed read path, never
+    // a change to it; airgap builds never see the S3 client.
+    let remote = remote_tier(remote_dir, pool)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -169,6 +165,44 @@ pub unsafe extern "C" fn flock_vfs_len(handle: *const FlockVfs) -> i64 {
     // SAFETY: caller guarantees `handle` is null or a live open handle.
     match unsafe { handle.as_ref() } {
         Some(h) => i64::try_from(h.source.total_len()).unwrap_or(-1),
+        None => -1,
+    }
+}
+
+/// The number of pages this handle has faulted from the object-storage tier — i.e. tier GETs, the
+/// object-storage round-trips a wake actually paid. Returns -1 on a null handle.
+///
+/// This is the observable that makes the lazy-wake claim checkable end-to-end: a point query on a small
+/// table in a large database should fault a *flat, small* number of pages regardless of database size,
+/// and a full scan should not. A host (the wake-latency harness today, a future `flockd` fault-accountant
+/// tomorrow) reads it to prove pages were served from the tier on demand rather than the whole file
+/// hydrated. It is a read of substrate's own `TierStats.misses`; it performs no I/O.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`flock_vfs_open`] and not yet closed.
+#[no_mangle]
+pub unsafe extern "C" fn flock_vfs_tier_misses(handle: *const FlockVfs) -> i64 {
+    // SAFETY: caller guarantees `handle` is null or a live open handle.
+    match unsafe { handle.as_ref() } {
+        // Saturate on the (practically unreachable) overflow rather than wrap: a miss count that will
+        // not fit i64 is still "very large", never negative, so it can never be mistaken for the -1
+        // null sentinel.
+        Some(h) => i64::try_from(h.source.store().stats().misses).unwrap_or(i64::MAX),
+        None => -1,
+    }
+}
+
+/// The number of pages this handle served from the local cache without a tier round-trip (cache hits).
+/// Returns -1 on a null handle. The companion to [`flock_vfs_tier_misses`]; together they show how much
+/// of a wake was served locally versus faulted from object storage.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by [`flock_vfs_open`] and not yet closed.
+#[no_mangle]
+pub unsafe extern "C" fn flock_vfs_tier_hits(handle: *const FlockVfs) -> i64 {
+    // SAFETY: caller guarantees `handle` is null or a live open handle.
+    match unsafe { handle.as_ref() } {
+        Some(h) => i64::try_from(h.source.store().stats().hits).unwrap_or(i64::MAX),
         None => -1,
     }
 }

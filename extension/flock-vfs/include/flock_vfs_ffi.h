@@ -40,6 +40,15 @@ FlockVfs *flock_vfs_open(const char *remote_dir, const char *cache_dir, const ch
 int64_t flock_vfs_len(const FlockVfs *handle);
 
 /*
+ * Observability: pages this handle faulted from the object-storage tier (tier GETs / cache misses),
+ * and pages served from the local cache (hits). -1 on a NULL handle. These read substrate's own
+ * TierStats and perform no I/O. They exist so a host can PROVE the lazy-wake claim end to end: a point
+ * query on a small table in a large database faults a flat, small number of pages regardless of size.
+ */
+int64_t flock_vfs_tier_misses(const FlockVfs *handle);
+int64_t flock_vfs_tier_hits(const FlockVfs *handle);
+
+/*
  * Serve `len` bytes at `offset` into `buf`, faulting pages on demand. Returns the number of bytes read
  * (0 at/past EOF, fewer than `len` on an end-of-file short read), or -1 on error. A negative `offset`,
  * a NULL handle, or a NULL `buf` with `len > 0` is an error. This is the fuzzed boundary.

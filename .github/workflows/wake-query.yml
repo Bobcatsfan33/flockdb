@@ -1,0 +1,80 @@
+name: wake to query (loaded extension)
+
+# The measurement RISK-1 STILL needed after wake-latency.yml: wake → first *query result*, through the
+# LOADED C++ FileSystem extension (extension/flock-vfs/) — DuckDB opens a sleeping database at a flock://
+# path, plans, executes, and returns rows, with pages faulted from substrate's tier on demand.
+#
+# wake-latency.yml measured wake → first *page read* (4.3 ms, 2 GETs). This measures the whole path
+# through DuckDB's open+plan+execute, and — the load-bearing part — shows the point-query wake→query and
+# its fault count stay FLAT as the database grows, while a full scan and an eager-hydration control both
+# scale O(data). That flat-vs-scaling contrast IS the result. NO 250 ms number is produced or quoted.
+#
+# It needs the bundled DuckDB build, so it runs on a runner with disk headroom (jlumbroso/free-disk-space
+# first), never on the dev Mac. Manual (workflow_dispatch): a measurement, not a merge gate.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    name: wake → first query result, through the loaded FlockFileSystem
+    runs-on: ubuntu-latest
+
+    steps:
+      # The bundled DuckDB build is what exhausts disk on the dev host. Reclaim ~30 GB of preinstalled
+      # toolchains first and build in RELEASE so disk is never the blocker here that it was on the Mac.
+      - name: Reclaim disk (remove preinstalled toolchains)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # MinIO from its official binary (image tags drift; the binary is what stood up locally). `mc`
+      # creates the bucket the S3 pass sleeps to. This is a same-runner, datacenter-local endpoint — a
+      # LOW-LATENCY-endpoint number, not a wide-area one, and the report says so.
+      - name: Stand up MinIO and create the bucket
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o minio
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
+          chmod +x minio mc
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            ./minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
+          ./mc alias set local http://localhost:9000 minioadmin minioadmin
+          ./mc mb --ignore-existing local/flockdb
+          echo "bucket flockdb ready"
+
+      # Build + LOAD the extension and run the wake→query matrix (LocalFileSystem floor + MinIO pass).
+      # run.sh builds the cdylib, the bundled DuckDB static lib, the harness, and the .duckdb_extension.
+      - name: Measure wake → first query result
+        env:
+          # Setting FLOCK_VFS_S3_URL turns on run.sh's second (MinIO) pass; the first pass always uses the
+          # LocalFileSystem floor. These are the vars flock-vfs's backend::remote_tier reads.
+          FLOCK_VFS_S3_URL: http://localhost:9000
+          FLOCK_VFS_S3_BUCKET: flockdb
+          FLOCK_VFS_S3_KEY_ID: minioadmin
+          FLOCK_VFS_S3_SECRET: minioadmin
+          FLOCK_VFS_S3_REGION: us-east-1
+        run: |
+          bash spikes/wake-query/run.sh
+
+      - name: Note on the numbers
+        if: always()
+        run: |
+          echo "This is wake → first QUERY RESULT through the loaded FlockFileSystem extension."
+          echo "Read the SHAPE, not any single cell: the point query's wake→query and fault count are"
+          echo "FLAT across database size; the full-scan and eager-hydration controls SCALE O(data)."
+          echo "The MinIO pass is a same-runner, low-latency endpoint — NOT wide-area, NOT a 250 ms claim."

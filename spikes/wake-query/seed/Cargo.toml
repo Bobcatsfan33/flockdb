@@ -1,0 +1,20 @@
+[package]
+name = "seed"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Substrate-only chunk/sleep, exactly like spikes/wake-latency/seed — EXCEPT the object-storage tier is
+# chosen by flock-vfs's own `remote_tier` (the code the extension's wake path uses), so seed and wake
+# agree on the backend: local disk by default, or S3/MinIO when built `--features s3` with
+# FLOCK_VFS_S3_URL set. The plain .duckdb file is produced by the C++ `measure seed` harness (which
+# links libduckdb.a); this tool only chunks it into substrate pages and sleeps the store.
+[dependencies]
+flock-vfs = { path = "../../../crates/flock-vfs" }
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[features]
+# Forward flock-vfs's s3 backend so the seeder can sleep to MinIO/S3 for the object-storage number.
+s3 = ["flock-vfs/s3"]

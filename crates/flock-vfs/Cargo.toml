@@ -46,3 +46,9 @@ default = []
 # no-op here; it must EXIST, or `cargo test --workspace --features airgap` fails to resolve for this
 # member and the airgap gate silently stops running for the whole workspace.
 airgap = []
+# `s3` compiles object_store's AWS client into the cdylib so `backend::remote_tier` can fault pages from
+# an S3-compatible store (MinIO, or a real bucket) instead of local disk — the backend swap RISK-1's
+# object-storage wake→query measurement needs. It is OFF by default and, deliberately, is NOT enabled by
+# `airgap`: the default and airgap builds contain no S3 client of their own, so the airgap amputation
+# (substrate rule 5) still holds. Only the measurement build turns it on.
+s3 = ["object_store/aws"]

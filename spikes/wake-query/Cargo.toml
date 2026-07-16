@@ -1,0 +1,15 @@
+# Out-of-workspace measurement spike (like spikes/wake-latency/ and proofs/lazy-wake/): a measurement
+# instrument, NOT shippable code, so it is its own workspace root and cargo does not fold it into the
+# FlockDB workspace. It has its own target/.
+#
+# The one difference from spikes/wake-latency/: this spike measures wake → first-QUERY-RESULT through
+# the LOADED C++ FileSystem extension (extension/flock-vfs/), not wake → first-page-read through a dyld
+# interpose shim. So its seeder reuses flock-vfs's real `remote_tier` backend selector (path dep), the
+# very code the extension's wake path uses — a page it writes is a page the extension reads back.
+[workspace]
+members = ["seed"]
+resolver = "2"
+
+[profile.release]
+# The measurement must be an optimized build or the latency is meaningless.
+opt-level = 3

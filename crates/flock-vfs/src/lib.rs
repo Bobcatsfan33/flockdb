@@ -43,12 +43,14 @@
 // *skipping* a test, not asserting in one). The denials above stay in force for all library code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod backend;
 pub mod error;
 pub mod ffi;
 pub mod read;
 pub mod source;
 pub mod tiered;
 
+pub use backend::remote_tier;
 pub use error::{Result, VfsError};
 pub use read::serve_read;
 pub use source::PageSource;

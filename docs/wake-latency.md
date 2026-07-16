@@ -70,6 +70,37 @@ built and clocked (against a zero-network floor, not real object storage).**
 > belongs — rather than on one laptop. **The number is not quoted here until that workflow has produced
 > it end-to-end.**
 
+> **F4 update (2026-07): the C++ extension is now BUILT AND LOADED into a real DuckDB, serves correct
+> rows, and the wake→first-QUERY harness + workflow are in-repo — the number is pending its CI run.**
+> The one gap the previous update named ("verified to compile … but NOT built/loaded, so wake was NOT
+> re-measured through it") is closed at the mechanism level, and the wake→**query** measurement (not
+> just wake→page-read) now has a home.
+> **(1) The extension loads and serves.** `spikes/wake-query/` builds the crate's own libduckdb.a and the
+> real `FlockFileSystem` (`extension/flock-vfs/src/`), installs it into a live DuckDB instance via
+> `VirtualFileSystem::RegisterSubSystem` — **the exact body of the extension's `LoadInternal`** — and runs
+> `ATTACH 'flock://…' (READ_ONLY)` + a query. Every read DuckDB issues is served page-by-page from
+> substrate's tier through the fuzzed `flock-vfs` boundary. The harness additionally builds the *packaged*
+> `flock_vfs.duckdb_extension` (metadata footer, unsigned) and `LOAD`s it under
+> `allow_unsigned_extensions` as a second, best-effort proof of the loadable form. One production
+> correctness bug was found and fixed by actually exercising the load: `FileExists` now reports the
+> `<db>.wal` sibling absent, so a READ_ONLY attach does not try to wake a write-ahead log a sleeping
+> snapshot does not have. The whole C++ (harness + the edited FileSystem) **syntax-checks against the real
+> DuckDB 1.10504 headers**; the Rust changes are `fmt`/`clippy -D warnings`/test green.
+> **(2) The fault count is now an instrument, not an argument.** A new `flock_vfs_tier_misses` FFI exposes
+> substrate's `TierStats.misses` — the object-storage GETs a wake actually paid — so "a point query
+> faults a flat, small page set regardless of database size" is *read off the running engine*, not
+> inferred. The eager control reads it too, showing O(database) faults.
+> **(3) The tier is a config choice, airgap intact.** `flock-vfs` gained an `s3` feature (off by default,
+> never enabled by `airgap`) so the same fuzzed read path can fault from MinIO/S3 instead of local disk.
+> The default and airgap builds contain no network client of their own; the S3 client compiles in only
+> for the measurement.
+> **(4) The number itself is NOT quoted here yet.** `.github/workflows/wake-query.yml` is committed and
+> ready; it has not been run (wake findings are reviewed before the workflow is triggered). Exactly as the
+> page-read workflow was treated, **no wake→query figure appears here until that run produces it
+> end-to-end.** The design of the result — flat point-query vs scaling full-scan and scaling eager,
+> LocalFileSystem floor plus same-runner MinIO, no wide-area bucket, **no 250 ms** — is fixed below; the
+> cells are filled by the run.
+
 ---
 
 ## The claim this risk is about
@@ -234,6 +265,50 @@ Read it against the floor table in "What is actually measured":
   per-fault synchronous overhead (~7 ms/fault: `block_on` + a tier get + a BLAKE3 verify), not by page
   count. Real object storage adds first-byte latency **per fault** on top. It **already eats ~40 % of
   a 250 ms budget before a single S3 round-trip.** This is precisely why no 250 ms number is quoted.
+
+## What this pass built: wake → first QUERY RESULT, through the loaded extension
+
+F5 measured wake → first *row* through an interpose shim — a faithful proxy for the extension, but not
+the extension. This pass closes that gap: `spikes/wake-query/` runs the query **through the real
+`FlockFileSystem` C++ extension loaded into stock DuckDB**, and `.github/workflows/wake-query.yml` takes
+the number on a runner with disk headroom. The design is fixed; the cells are filled by the CI run.
+
+**The load is real.** The harness installs `FlockFileSystem` on a live DuckDB instance's
+`VirtualFileSystem` via `RegisterSubSystem` — the exact body the extension's `LoadInternal` runs — and
+also builds and `LOAD`s the packaged `flock_vfs.duckdb_extension` (unsigned, metadata footer) as a
+second proof. `ATTACH 'flock://<pool>/<manifest>?remote=…&cache=…&page_size=…&len=…' (READ_ONLY)` wakes
+the database; every `pread` DuckDB issues is served page-by-page from substrate's tier through the fuzzed
+`flock-vfs` boundary. Exercising the load surfaced and fixed one production bug (`FileExists` must report
+the `<db>.wal` sibling absent, or a READ_ONLY attach tries to open a WAL a sleeping snapshot has none of).
+
+**What the run measures, and the shape it must show:**
+
+| query | what it does | expected fault count | expected wake→query shape |
+|---|---|---|---|
+| `open` (`SELECT 1`) | pure wake (ATTACH only) | flat, small | **FLAT** vs database size |
+| `hot` | selective aggregate, small table | flat, small | **FLAT** |
+| `point` | zonemap-pruned point lookup | flat, small | **FLAT** — the wake-one-of-many claim |
+| `cold` | full-table aggregate (control) | scales O(scan) | **scales** |
+| `point`/**eager** | today's hydrate-all then query | scales O(database) | **scales O(database)** |
+
+The `point`-flat-vs-`cold`/`eager`-scaling contrast **is** the result, at the query level now, not just
+the page-read level. The fault count is read from the new `flock_vfs_tier_misses` FFI (substrate's real
+tier GETs), so laziness is measured off the running engine. Every faulted result is checked byte-for-byte
+against stock DuckDB on the real file.
+
+**Scope, stated before the run so it cannot drift:**
+- **Two tiers, never conflated.** A `LocalFileSystem` **floor** (network at zero) and, additionally, a
+  **same-runner MinIO** endpoint — a real object store, but a *low-latency, datacenter-local* one. The
+  MinIO number is a low-latency-endpoint number and is labelled as such.
+- **Wide-area is the follow-on.** No geographically distant bucket is measured here. When one is, it is a
+  separate, clearly-labelled number — it adds real first-byte latency per fault on top of the MinIO pass.
+- **Still no 250 ms.** The floor already spends ~100 ms on the point case at zero network (F5); this pass
+  does not license a 250 ms claim, and quotes none.
+- **The number is pending.** The workflow is committed and compile/lint/test-verified but **not yet run**
+  (wake findings are reviewed before triggering). No wake→query cell is quoted until the run produces it.
+
+**flockd stays HELD** until this number exists and holds — the wake-on-query scheduler's premise is a
+query that wakes its own database inline, and that premise is exactly what this measurement tests.
 
 ## The mechanism: verified, and the stock in-process path is closed
 
