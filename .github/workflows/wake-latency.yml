@@ -18,24 +18,6 @@ jobs:
     name: wake → first page fault, through MinIO
     runs-on: ubuntu-latest
 
-    # A real S3-compatible endpoint, as a service container. We proved MinIO stands up; here it is the
-    # object storage the read path faults pages from.
-    services:
-      minio:
-        image: bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          # Bitnami's MinIO image creates this bucket on startup, so the test's `flockdb` bucket exists.
-          MINIO_DEFAULT_BUCKETS: flockdb
-        options: >-
-          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
     steps:
       # DuckDB's *debug* build is what exhausts disk on the dev host. On the runner we reclaim the
       # ~30 GB of preinstalled toolchains first, and build the measurement in RELEASE — a fraction of
@@ -54,8 +36,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Confirm the endpoint is up
-        run: curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
+      # Run MinIO from its official binary rather than a Docker image — image tags drift (bitnami
+      # dropped `:latest`), and the binary is exactly what was proven to stand up locally. `mc` creates
+      # the `flockdb` bucket the test expects.
+      - name: Stand up MinIO and create the bucket
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o minio
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
+          chmod +x minio mc
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            ./minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
+          ./mc alias set local http://localhost:9000 minioadmin minioadmin
+          ./mc mb --ignore-existing local/flockdb
+          echo "bucket flockdb ready"
 
       # flock-vfs is pure Rust on substrate — NO DuckDB — so this builds and runs in release without
       # the debug-DuckDB disk problem. The test is `#[ignore]`d, so `--ignored` runs exactly it.
