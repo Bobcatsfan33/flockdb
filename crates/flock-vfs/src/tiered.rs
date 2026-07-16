@@ -9,9 +9,20 @@
 
 use crate::error::{Result, VfsError};
 use crate::source::PageSource;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use substrate_pager::PageStore;
 use substrate_store::TieredStore;
+
+/// The most pages a single [`prefetch`](TieredPageSource::prefetch) call will fault concurrently.
+///
+/// A fault is one blocking call that ends in an object-storage GET on a miss (see `read_page`), so the
+/// fan-out is bounded by how many concurrent GETs we are willing to open at once, not by CPU. Sixteen
+/// covers the wake-one-of-many fault set (~21 pages) in ~two waves while staying well under any object
+/// store's per-connection ceiling; a scheduler that has measured its wide-area tier can prefetch in
+/// whatever chunks it likes — this only caps the concurrency *within* one call. Kept deliberately small
+/// and boring (rule 7); the wide-area measurement, not a guess, decides if it should grow.
+const PREFETCH_FANOUT: usize = 16;
 
 /// How many independent fault gates guard concurrent first-faults (see [`TieredPageSource`]). A page is
 /// gated by `page_no % FAULT_STRIPES`, so the same page always takes the same gate while distinct pages
@@ -99,5 +110,33 @@ impl PageSource for TieredPageSource {
         // One copy out of the page cache. The zero-copy alternative and why we do not take it is in the
         // `PageSource` docs.
         Ok(page.as_bytes().to_vec())
+    }
+
+    /// Coalesce the fault set: fan the pages out across a bounded pool of scoped threads so their
+    /// tier GETs run concurrently. Each worker calls `read_page`, so every page still goes through the
+    /// same gated, verified fault the reactive path uses — the only thing that changes is that N misses
+    /// overlap in time instead of running back-to-back. See the trait method for why this is advisory
+    /// (a failed warm is dropped; the page faults for real on read).
+    fn prefetch(&self, pages: &[u64]) {
+        if pages.is_empty() {
+            return;
+        }
+        let workers = pages.len().min(PREFETCH_FANOUT);
+        let cursor = AtomicUsize::new(0);
+        // `scope` joins every worker before returning, so `&self` and `pages` outlive the threads
+        // without `Arc`/`'static` — the borrow checker proves the warm is finished when prefetch is.
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(&page_no) = pages.get(i) else {
+                        break;
+                    };
+                    // Best-effort: a warm failure is intentionally dropped (trait docs). The page is
+                    // simply left cold and faults — correctly, or with a real error — if actually read.
+                    let _ = self.read_page(page_no);
+                });
+            }
+        });
     }
 }

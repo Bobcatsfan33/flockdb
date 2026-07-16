@@ -42,4 +42,37 @@ pub trait PageSource {
     /// fetches from the object-storage tier and verifies the page's content hash before returning it.
     /// Either way only pages a read actually covers are ever requested.
     fn read_page(&self, page_no: u64) -> Result<Vec<u8>>;
+
+    /// Warm a set of pages into the local cache, **coalescing their faults** so that N pages that
+    /// each miss the object-storage tier cost roughly one round-trip of wall-clock instead of N.
+    ///
+    /// # Why this exists
+    ///
+    /// A woken database answers a selective query by faulting a small, flat set of pages (`docs/04`,
+    /// the wake-one-of-many measurement: ~21 pages regardless of database size). On a local or
+    /// same-runner tier those faults are ~free and their *order* does not matter. Against a
+    /// **wide-area** object store each fault is a real network round-trip, and DuckDB issues its reads
+    /// *serially* — one range, wait, the next — so faulting reactively turns those ~21 faults into ~21
+    /// serial RTTs, which is where a sub-second wake dies. This method lets a scheduler fault the whole
+    /// predicted set **at once, concurrently**, before DuckDB's serial reads arrive; by the time they
+    /// do, the pages are resident and each read is a local-cache hit.
+    ///
+    /// # It is advisory, and that is deliberate — not a swallowed error
+    ///
+    /// Prefetch's *only* effect is residency. It changes no bytes and weakens no check: every page
+    /// DuckDB actually reads still goes through [`serve_read`](crate::read::serve_read), which
+    /// re-derives and verifies the page's content hash. So a page that fails to prefetch (a transient
+    /// tier error, a page that turns out not to exist) is simply left cold and faults for real —
+    /// correctly, or with a real error — when, and only if, DuckDB reads it. Propagating a prefetch
+    /// failure would be worse than useless: it would fail a wake over a page the query may never touch.
+    /// A prefetch error is therefore *dropped on purpose*, documented here rather than hidden.
+    ///
+    /// The default implementation warms serially — correct, but not coalesced. A tiered source
+    /// overrides it to fan the faults out concurrently.
+    fn prefetch(&self, pages: &[u64]) {
+        for &page_no in pages {
+            // Best-effort warm; see the "advisory" note above. A cold page faults for real on read.
+            let _ = self.read_page(page_no);
+        }
+    }
 }
