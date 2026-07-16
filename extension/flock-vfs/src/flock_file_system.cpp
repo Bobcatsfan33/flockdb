@@ -22,7 +22,13 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 namespace {
 
-constexpr const char *kScheme = "flock://";
+// The canonical URI a caller writes is `flock://<pool>/<manifest>?...`, but DuckDB NORMALISES a path
+// before it reaches the FileSystem — it collapses consecutive slashes, so `flock://pool/…` arrives as
+// `flock:/pool/…` (ONE slash). So we match on the bare `flock:` scheme and then skip however many
+// slashes remain; the original double-slash and the normalised single-slash both parse. Matching the
+// literal `flock://` instead made every ATTACH fail with "database does not exist", because the
+// normalised path was never routed to this subsystem at all.
+constexpr const char *kSchemeBare = "flock:";
 
 struct FlockUri {
 	std::string pool;
@@ -35,13 +41,18 @@ struct FlockUri {
 
 //! Parse the `flock://` URI, throwing an actionable error if any field is missing or malformed.
 FlockUri ParseFlockUri(const string &path) {
-	if (path.rfind(kScheme, 0) != 0) {
+	if (path.rfind(kSchemeBare, 0) != 0) {
 		throw InvalidInputException("flock-vfs: '%s' is not a flock:// path. Expected "
 		                            "flock://<pool>/<manifest_hex>?remote=<dir>&cache=<dir>&"
 		                            "page_size=<n>&len=<n>",
 		                            path);
 	}
-	std::string rest = path.substr(std::string(kScheme).size());
+	// Strip `flock:` and then ALL leading slashes, so both `flock://pool/...` and DuckDB's normalised
+	// `flock:/pool/...` yield the same `pool/manifest?params`.
+	std::string rest = path.substr(std::string(kSchemeBare).size());
+	while (!rest.empty() && rest.front() == '/') {
+		rest.erase(rest.begin());
+	}
 
 	auto qpos = rest.find('?');
 	if (qpos == std::string::npos) {
@@ -119,7 +130,7 @@ void FlockFileHandle::Close() {
 // FlockFileSystem
 //===----------------------------------------------------------------------===//
 bool FlockFileSystem::CanHandleFile(const string &fpath) {
-	return fpath.rfind(kScheme, 0) == 0;
+	return fpath.rfind(kSchemeBare, 0) == 0;
 }
 
 unique_ptr<FileHandle> FlockFileSystem::OpenFile(const string &path, FileOpenFlags flags,
