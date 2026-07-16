@@ -142,16 +142,26 @@ int do_expected(const std::string &which, long cold_rows, const char *realpath) 
 }
 
 // An observing subclass so the harness can read the tier fault count of the handle DuckDB opened. It
-// adds no behaviour — it records the last-opened FlockVfs* (the measurement is single-threaded) so
-// `flock_vfs_tier_misses` can be read while the handle is still open, right after the query. The
-// production FlockFileSystem is left untouched.
+// adds no behaviour — it records the last-opened *database* FlockVfs* so `flock_vfs_tier_misses` can be
+// read while the handle is still open, right after the query. The production FlockFileSystem is left
+// untouched.
+//
+// Crucially it records only handles that carry a real vfs. A READ_ONLY ATTACH also opens the
+// `<db>.wal` sibling, and a sleeping snapshot has no WAL, so that open returns an EMPTY handle with
+// `vfs == nullptr` (see FlockFileSystem::OpenFile). If we captured that one it would clobber the real
+// database handle and `flock_vfs_tier_misses` would read -1 — which is exactly the bogus fault count
+// the lazy rows reported before this guard. The `.wal` open happens after the db open, so filtering by
+// a non-null vfs (not by open order) is what keeps `last_vfs` pointing at the handle that served the
+// query's faults.
 class MeasuringFS : public FlockFileSystem {
 public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener) override {
 		auto handle = FlockFileSystem::OpenFile(path, flags, opener);
 		if (handle) {
-			last_vfs = handle->Cast<FlockFileHandle>().vfs;
+			if (FlockVfs *vfs = handle->Cast<FlockFileHandle>().vfs) {
+				last_vfs = vfs;
+			}
 		}
 		return handle;
 	}
