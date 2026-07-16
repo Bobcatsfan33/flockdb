@@ -194,23 +194,35 @@ FileType FlockFileSystem::GetFileType(FileHandle &handle) {
 bool FlockFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	(void)opener;
 	// A flock:// path denotes a sleeping database that exists by construction of its WakeToken; the
-	// wake in OpenFile is the real existence check. Report true for a well-formed database URI so
-	// DuckDB opens it rather than short-circuiting.
+	// wake in OpenFile is the real existence check. Report true for any flock:// path so DuckDB opens
+	// it rather than short-circuiting — OpenFile does the real validation and throws a clear error if
+	// the wake parameters are missing or wrong.
 	//
-	// BUT report the SIBLING paths DuckDB probes on open as absent — chiefly `<db>.wal`. A sleeping
-	// database is a single immutable snapshot with no separate write-ahead log; if we claimed its `.wal`
-	// existed, DuckDB (even for a READ_ONLY attach) would try to open and replay a WAL that is not there.
-	// A well-formed database URI carries its wake parameters in a query string and does not end in
-	// ".wal"; anything ending ".wal" is a probe for a log this snapshot does not have.
+	// **Do NOT require the query string here.** DuckDB's READ_ONLY `ATTACH` existence probe calls
+	// `FileExists` with the query string *stripped* (`flock://<pool>/<manifest>`, no `?`), while the
+	// full URI (with the wake params) is what reaches `OpenFile`. An earlier version demanded a `?`,
+	// which made that stripped probe report "database does not exist" and the attach failed. The scheme
+	// is the existence signal; the params are OpenFile's problem.
+	//
+	// BUT report the SIBLING paths DuckDB probes as absent — chiefly `<db>.wal`. A sleeping database is
+	// a single immutable snapshot with no separate write-ahead log; claiming its `.wal` existed would
+	// make DuckDB (even READ_ONLY) try to open and replay a WAL that is not there. Anything ending
+	// ".wal" — with or without a trailing query string — is a probe for a log this snapshot lacks.
 	if (!CanHandleFile(filename)) {
 		return false;
 	}
+	// Strip any trailing query string before checking the `.wal` suffix, so both `<db>.wal` and
+	// `<db>.wal?params` are recognised as a WAL probe.
+	std::string bare = filename;
+	if (auto q = bare.find('?'); q != std::string::npos) {
+		bare.resize(q);
+	}
 	const std::string wal_suffix = ".wal";
-	if (filename.size() >= wal_suffix.size() &&
-	    filename.compare(filename.size() - wal_suffix.size(), wal_suffix.size(), wal_suffix) == 0) {
+	if (bare.size() >= wal_suffix.size() &&
+	    bare.compare(bare.size() - wal_suffix.size(), wal_suffix.size(), wal_suffix) == 0) {
 		return false;
 	}
-	return filename.find('?') != std::string::npos;
+	return true;
 }
 
 void FlockFileSystem::Seek(FileHandle &handle, idx_t location) {
