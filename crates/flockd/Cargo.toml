@@ -1,0 +1,26 @@
+[package]
+name = "flockd"
+description = "The wake scheduler for sleeping, tiered FlockDB databases: learn a database's warm set from one query, then coalesce that set into a single concurrent prefetch on the next cold wake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "wake", "prefetch", "tiering", "scheduler"]
+categories = ["database-implementations"]
+
+[dependencies]
+# The library core — the scheduler — depends only on the read path's `PageSource` seam. It does NOT
+# depend on tokio, object_store, or DuckDB: waking, faulting, and the async tier all live below
+# `PageSource`, and the scheduler's whole job is *which pages to warm and when*, which is pure. Keeping
+# it that way means the scheduler is testable against the same in-memory `PageSource` the fuzzer uses.
+flock-vfs = { path = "../flock-vfs", version = "0.1.0" }
+
+[dev-dependencies]
+# The end-to-end wake→warm→serve proof needs a real (local) tier, exactly like flock-vfs's own
+# roundtrip test. These are the machinery below `PageSource`, pulled in only for the test.
+substrate-pager = { workspace = true }
+substrate-store = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }

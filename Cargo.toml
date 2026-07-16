@@ -5,6 +5,7 @@ members = [
     "crates/flock-sync",
     "crates/flock-vfs",
     "crates/flock-cli",
+    "crates/flockd",
     "bindings/python",
 ]
 # The fuzz target is a nightly, libFuzzer-instrumented crate. It is NOT a workspace member — it must
