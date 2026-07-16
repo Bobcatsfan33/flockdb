@@ -93,11 +93,39 @@ network is.
 
 ## What is actually measured
 
-**Wake against a real S3 endpoint: NOT MEASURED.** The blocker has moved, and it is worth being precise
-about, because "not measured" must not rot into "can't be measured". During F1 no S3 endpoint was
+**The read path's object-storage round-trip: NOW MEASURED (CI).** The
+`.github/workflows/wake-latency.yml` workflow stood MinIO up on a GitHub Actions runner and ran the
+DuckDB-free `s3_measure` test against it. The result — wake → first **page read**, through a real
+S3-compatible endpoint:
+
+| step | time | S3 GETs |
+|---|---:|---:|
+| wake (fetch head manifest) | 3.0 ms | — |
+| first page fault (4 KiB) | 1.4 ms | — |
+| second point fault (256 B) | 1.3 ms | — |
+| **wake + first read** | **4.3 ms** | **2** |
+
+Read this precisely, because the scope is the whole point:
+- **This is wake → first page *read*, NOT wake → first *query*.** It measures the object-storage
+  round-trip the read path pays — the piece the zero-network floor could not — not the full path
+  through DuckDB's open + plan + execute. That is the honest thing this workflow can measure without a
+  DuckDB build, and it is exactly the piece RISK-1 was uncertain about.
+- **Only 2 S3 GETs** for wake + a point read, which is the flat, small fault set (the F4/F5 proof) now
+  confirmed end-to-end against real object storage: the page-faulting read path fetches the pages it
+  needs and nothing else.
+- **It is a same-runner MinIO, not wide-area S3.** The network hop is a datacenter-local one, so 4.3 ms
+  is a *low-latency-endpoint* number, not a cross-region one. A geographically distant bucket adds real
+  first-byte latency per GET on top.
+- **Still no 250 ms claim.** The full wake → first-*query* number, and a wide-area bucket, remain
+  unmeasured. What this establishes is narrower and solid: the read path's object-storage overhead is
+  **two small GETs, not a whole-file download** — which is the load-bearing question, and the answer is
+  the one the fault-set proof predicted.
+
+**The earlier blocker, for the record — disk, not network.** During F1 no S3 endpoint was
 reachable at all (Docker would not start headlessly; downloading MinIO was denied). During **F4, a real
 MinIO S3 endpoint *was* stood up** — downloaded, started, `/minio/health/live` returned 200 — so the
-network is no longer the wall. What blocked the number instead was **disk**, on a near-full shared host:
+network was no longer the wall. What blocked the number on the *dev host* was **disk**, on a near-full
+shared machine:
 (a) flock-core's DuckDB-linked test binary (`wake_latency_against_a_real_s3_endpoint`) could not be
 *linked* within the available headroom, and (b) MinIO returned **HTTP 507 Insufficient Storage** on
 writes because its backing store shared the same near-full volume. Two `#[ignore]`d tests yield the
