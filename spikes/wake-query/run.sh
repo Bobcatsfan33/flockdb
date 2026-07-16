@@ -55,7 +55,7 @@ echo "headers     : $HDR"
 echo "== compiling the measurement harness (links libduckdb.a whole + flock-vfs) =="
 # -rdynamic + --whole-archive so the DuckDB symbols the dlopened .duckdb_extension needs are present and
 # exported from this process at LOAD time. Register mode does not need that, but one binary serves both.
-clang++ -std=c++17 -O2 \
+"${CXX:-g++}" -std=c++17 -O2 \
   -I"$HDR" -I"$ROOT/extension/flock-vfs/include" -I"$ROOT/extension/flock-vfs/src" \
   "$PWD/measure.cpp" "$ROOT/extension/flock-vfs/src/flock_file_system.cpp" \
   -Wl,--whole-archive "$LIB" -Wl,--no-whole-archive \
@@ -70,7 +70,7 @@ echo "== building the loadable .duckdb_extension (hidden visibility, DuckDB symb
 # No libduckdb linked: its symbols resolve from the harness process at dlopen. flock-vfs IS linked so the
 # extension and harness share one cdylib instance (one tier state).
 EXT="$WORK/flock_vfs.duckdb_extension"
-clang++ -std=c++17 -O2 -fPIC -fvisibility=hidden -shared \
+"${CXX:-g++}" -std=c++17 -O2 -fPIC -fvisibility=hidden -shared \
   -I"$HDR" -I"$ROOT/extension/flock-vfs/include" \
   "$ROOT/extension/flock-vfs/src/flock_vfs_extension.cpp" \
   "$ROOT/extension/flock-vfs/src/flock_file_system.cpp" \
