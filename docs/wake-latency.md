@@ -61,6 +61,14 @@ built and clocked (against a zero-network floor, not real object storage).**
 > near-full volume. A DuckDB-free read-path measurement (`crates/flock-vfs/tests/s3_measure.rs`) is now
 > committed for anyone with a bucket and adequate disk. **Still forbidden, still absent: any 250 ms
 > number.**
+>
+> **(4) The measurement now has a home: CI, not the dev Mac.** The disk is a *host* problem — DuckDB's
+> debug build refills whatever `cargo clean` frees — so the object-storage number is taken by a GitHub
+> Actions workflow (`.github/workflows/wake-latency.yml`): it reclaims ~30 GB of preinstalled runner
+> toolchains, stands MinIO up as a service container, and runs `s3_measure` **in release** (a fraction
+> of the debug footprint). That puts the honesty-critical number in-repo and reproducible — where it
+> belongs — rather than on one laptop. **The number is not quoted here until that workflow has produced
+> it end-to-end.**
 
 ---
 

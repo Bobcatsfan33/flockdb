@@ -1,0 +1,77 @@
+name: wake latency (object storage)
+
+# The honesty-critical measurement RISK-1 is about: end-to-end wake→first-page-fault through a REAL
+# object-storage endpoint. It could not be taken on the dev machine (a near-full shared disk), so it
+# lives here — in-repo, reproducible, and against a real S3-compatible endpoint (MinIO).
+#
+# This answers the ONE open question the zero-network floor cannot: the object-storage round-trip. Until
+# this run produces a number, NO 250 ms figure is quoted anywhere, and the claim stays scoped —
+# wake-one-of-many is flat, cold full scans are O(data), and the round-trip is what this measures.
+#
+# Manual (workflow_dispatch): it is a measurement, not a merge gate, and it needs the endpoint stood up.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    name: wake → first page fault, through MinIO
+    runs-on: ubuntu-latest
+
+    # A real S3-compatible endpoint, as a service container. We proved MinIO stands up; here it is the
+    # object storage the read path faults pages from.
+    services:
+      minio:
+        image: bitnami/minio:latest
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          # Bitnami's MinIO image creates this bucket on startup, so the test's `flockdb` bucket exists.
+          MINIO_DEFAULT_BUCKETS: flockdb
+        options: >-
+          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      # DuckDB's *debug* build is what exhausts disk on the dev host. On the runner we reclaim the
+      # ~30 GB of preinstalled toolchains first, and build the measurement in RELEASE — a fraction of
+      # the size — so disk is never the blocker here the way it was on the Mac.
+      - name: Reclaim disk (remove preinstalled toolchains)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Confirm the endpoint is up
+        run: curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
+
+      # flock-vfs is pure Rust on substrate — NO DuckDB — so this builds and runs in release without
+      # the debug-DuckDB disk problem. The test is `#[ignore]`d, so `--ignored` runs exactly it.
+      - name: Measure wake → first page fault through object storage
+        env:
+          MINIO_URL: http://localhost:9000
+          MINIO_BUCKET: flockdb
+          MINIO_USER: minioadmin
+          MINIO_PASSWORD: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          cargo test -p flock-vfs --release --test s3_measure -- --ignored --nocapture
+
+      - name: Note on the number
+        if: always()
+        run: |
+          echo "This is the object-storage round-trip for wake-one-of-many (point/small)."
+          echo "It does NOT license a 250 ms marketing claim on its own — read it against the"
+          echo "zero-network floor in docs/wake-latency.md. Cold full scans remain O(data)."
