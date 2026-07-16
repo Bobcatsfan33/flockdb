@@ -56,19 +56,50 @@ async fn seed_and_sleep(
     (token, data.len() as u64)
 }
 
+/// Build an S3 [`RemoteTier`] for `pool`, in one of two modes decided by the environment:
+///
+/// - **Same-runner MinIO** (`MINIO_URL` set): a custom endpoint over HTTP with an explicit
+///   key/secret. This is the low-latency control — its round-trip is ~local, so serial ≈ coalesced.
+/// - **Real AWS S3, wide-area** (`MINIO_URL` unset): a region-derived HTTPS endpoint, credentials from
+///   the standard `AWS_*` environment — which the workflow maps from repository secrets, never echoing
+///   them. `WAKE_ENDPOINT` (optional) points at an S3-compatible service that needs a custom endpoint
+///   (e.g. Cloudflare R2). This is the genuinely-remote number the coalescing thesis rests on.
+fn build_s3_backend(pool: &str) -> RemoteTier {
+    let bucket = std::env::var("WAKE_BUCKET")
+        .or_else(|_| std::env::var("MINIO_BUCKET"))
+        .unwrap_or_else(|_| "flockdb".into());
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+
+    if let Ok(url) = std::env::var("MINIO_URL") {
+        builder = builder
+            .with_endpoint(url)
+            .with_allow_http(true)
+            .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
+            .with_secret_access_key(
+                std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
+            );
+    } else {
+        // Real AWS S3 (or an S3-compatible service via WAKE_ENDPOINT). Region + creds from the AWS_*
+        // env the CI populates from secrets; HTTPS by default (no with_allow_http).
+        if let Ok(region) = std::env::var("AWS_REGION").or_else(|_| std::env::var("WAKE_REGION")) {
+            builder = builder.with_region(region);
+        }
+        if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        if let Ok(endpoint) = std::env::var("WAKE_ENDPOINT") {
+            builder = builder.with_endpoint(endpoint);
+        }
+    }
+
+    let backend = builder.build().expect("build an S3 client");
+    RemoteTier::new(Arc::new(backend), pool.to_string())
+}
+
 fn s3_backend() -> RemoteTier {
-    let url = std::env::var("MINIO_URL")
-        .expect("MINIO_URL is not set — this test needs a real S3-compatible endpoint");
-    let backend = AmazonS3Builder::new()
-        .with_endpoint(url)
-        .with_bucket_name(std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "flockdb".into()))
-        .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
-        .with_secret_access_key(
-            std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
-        )
-        .with_allow_http(true)
-        .build()
-        .expect("build an S3 client");
     // A fresh pool per run so repeated runs do not read each other's warm objects.
     let pool = format!(
         "flockvfs-{}",
@@ -77,7 +108,7 @@ fn s3_backend() -> RemoteTier {
             .unwrap()
             .as_millis()
     );
-    RemoteTier::new(Arc::new(backend), pool)
+    build_s3_backend(&pool)
 }
 
 #[test]
@@ -260,16 +291,5 @@ fn serial_vs_coalesced_fault_fetch_against_a_real_s3_endpoint() {
 }
 
 fn s3_backend_same_pool(pool: &str) -> RemoteTier {
-    let url = std::env::var("MINIO_URL").unwrap();
-    let backend = AmazonS3Builder::new()
-        .with_endpoint(url)
-        .with_bucket_name(std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "flockdb".into()))
-        .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
-        .with_secret_access_key(
-            std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
-        )
-        .with_allow_http(true)
-        .build()
-        .expect("build an S3 client");
-    RemoteTier::new(Arc::new(backend), pool.to_string())
+    build_s3_backend(pool)
 }

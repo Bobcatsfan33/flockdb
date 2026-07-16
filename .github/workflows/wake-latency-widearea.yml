@@ -1,0 +1,44 @@
+name: wake latency (wide-area, real S3)
+
+# The wide-area wake number: the flock-vfs read path measured against a GENUINELY REMOTE S3 bucket, so
+# the per-fault round-trip is a real one. This is what the same-runner MinIO number cannot show — and
+# what the coalesced-prefetch thesis rests on: does firing the ~21-page fault set concurrently collapse
+# it into one or two batched round-trips instead of ~21 serial ones, over real distance.
+#
+# Credentials come from repository secrets, read by name into the step environment. They are never
+# echoed, and object_store speaks HTTPS to AWS (no with_allow_http in the real-S3 path).
+#
+# Manual only: it is a measurement, it costs a few object-storage requests, and the reviewer decides
+# when to take it.
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    name: serial vs coalesced fault fetch, over real S3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # flock-vfs is pure Rust on substrate — no DuckDB — so release builds cheaply; this keeps disk
+      # pressure off without needing the big free-disk reclaim the DuckDB path required.
+      - name: Measure wake and serial-vs-coalesced fault fetch over real S3
+        env:
+          # Mapped from repo secrets by NAME. GitHub masks them in logs; the harness never prints them.
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.WAKE_REGION }}
+          WAKE_BUCKET: ${{ secrets.WAKE_BUCKET }}
+          # WAKE_ENDPOINT intentionally unset: region-based AWS endpoint. (Set it as a secret only for an
+          # S3-compatible service like R2 that needs a custom endpoint.)
+        run: |
+          set -eu
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${WAKE_BUCKET:-}" ]; then
+            echo "::error::wide-area secrets are not set (need AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, WAKE_REGION, WAKE_BUCKET)."
+            exit 1
+          fi
+          echo "Measuring against bucket '$WAKE_BUCKET' in region '$AWS_REGION' (credentials from secrets, not shown)."
+          # MINIO_URL deliberately UNSET → the harness uses the real-AWS (HTTPS, region-derived) path.
+          cargo test -p flock-vfs --release --test s3_measure -- --ignored --nocapture
