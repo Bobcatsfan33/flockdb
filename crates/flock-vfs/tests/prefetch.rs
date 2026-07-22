@@ -98,10 +98,17 @@ fn prefetch_warms_the_set_so_reads_do_not_re_fault() {
     // Warm the whole file in one coalesced call, from a non-runtime thread.
     source.prefetch(&all_pages);
     let after_prefetch = source.store().stats().misses;
+    // It must have faulted the cold tier — but NOT necessarily once per logical page. This is a
+    // content-addressed store: identical pages share one object, so the miss count is the number of
+    // distinct *objects*, which is `<= n_pages` and content-dependent. (The old `>= n_pages` assertion
+    // was wrong on that, and flaky on top of it, because this per-page fan-out races when several
+    // logical pages resolve to the same object — exactly the redundancy substrate's `get_batch`
+    // dedupe-by-object fixes. This primitive is superseded by `get_batch`; the F4 wake redesign will
+    // consume it, and this test's load-bearing half is the zero-re-fault check below.)
     assert!(
-        after_prefetch >= n_pages,
-        "prefetch should have faulted every page at least once from the cold tier: \
-         saw {after_prefetch} misses for {n_pages} pages"
+        (1..=n_pages).contains(&after_prefetch),
+        "prefetch should have faulted between 1 and {n_pages} distinct objects from the cold tier, \
+         saw {after_prefetch}"
     );
 
     // The payoff: reading the whole file back now must add ZERO tier misses — every page the read
