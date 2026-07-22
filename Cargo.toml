@@ -26,14 +26,18 @@ repository = "https://github.com/Bobcatsfan33/flockdb"
 # a moving dependency under a storage engine means the on-disk format can change without a
 # version bump, and a store written on Tuesday stops opening on Wednesday.
 #
-# v1.2.1 and not v1.1, for one reason that would have bitten us exactly once, in production, on the
+# v1.2.1+ and not v1.1, for one reason that would have bitten us exactly once, in production, on the
 # database that mattered: v1.1's `sleep()` uploaded only the HEAD manifest. An overlay manifest
 # cannot resolve the pages it did not itself touch without its base — and overlays are the normal
 # case — so a database whose head was an overlay woke up able to read whatever the top overlay
 # happened to hold, and nothing else. Silently. v1.2.1 uploads the head's whole ancestry.
-substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
-substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
-substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+# v1.2.2 made airgap a real compile-time amputation (no S3 client under --no-default-features).
+# v1.3.0 adds the additive TieredStore::get_batch (dedupe-by-object concurrent multi-page fetch) — the
+# shared primitive the F4 wake redesign consumes; single-page path unchanged, so this re-pin is a no-op
+# until flock-vfs/flockd map their fault sets onto it.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.3.0" }
+substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.3.0" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.3.0" }
 
 # Object storage, and the async runtime it needs.
 #
